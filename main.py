@@ -16,13 +16,13 @@ Run:
 import sys
 from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
+from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow, QTabWidget
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ui.live_tab import LiveTab
 from ui.logs_tab import LogsTab
 from ui.program_tab import ProgramTab
-from ui.theme import apply_theme, style_tabs
+from ui.theme import COLORS, apply_theme, style_tabs
 
 APP_DIR = Path(__file__).resolve().parent
 PROGRAMS_DIR = APP_DIR / "programs"
@@ -58,6 +58,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Import or load a program in Program Manager, set it active, then align the board and inspect."
         )
+        # A permanent widget docks at the right end of the status bar --
+        # bottom-right of the window, and stays there across every tab
+        # and resize without any manual positioning.
+        watermark = QLabel("A.alim")
+        watermark.setStyleSheet(f"color: {COLORS['faint']}; padding-right: 6px;")
+        self.statusBar().addPermanentWidget(watermark)
 
     def _on_program_activated(self, program, part_sizes):
         self.live_tab.set_program(program, part_sizes)
