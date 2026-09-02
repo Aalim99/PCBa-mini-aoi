@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# generated program data (local to each install, not source)
+programs/*.json
+!programs/.gitkeep
