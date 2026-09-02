@@ -6,3 +6,6 @@ venv/
 # generated program data (local to each install, not source)
 programs/*.json
 !programs/.gitkeep
+
+# inspection results (runtime data, per station)
+logs/

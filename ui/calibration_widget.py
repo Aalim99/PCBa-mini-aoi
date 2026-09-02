@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QMessageBox,
+    QPushButton, QMessageBox, QDialog,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
@@ -223,6 +223,38 @@ class CalibrationWidget(QWidget):
         if self.frame_bgr is not None:
             self.canvas.set_frame(self.frame_bgr)
         self.status_label.setText("Reset. Load a frame and run auto-detect or manual calibration.")
+
+
+class CalibrationDialog(QDialog):
+    """Modal wrapper around CalibrationWidget, for calibrating from the
+    Live Inspection tab. Accepts once a calibration succeeds."""
+
+    def __init__(self, frame_bgr, fiducials_mm, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calibrate Board")
+        self.resize(900, 720)
+        self.result_calibration: Optional[CalibrationResult] = None
+
+        layout = QVBoxLayout(self)
+        self.widget = CalibrationWidget()
+        self.widget.load_frame(frame_bgr, fiducials_mm)
+        self.widget.calibrated.connect(self._on_calibrated)
+        layout.addWidget(self.widget)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.use_btn = QPushButton("Use This Calibration")
+        self.use_btn.setEnabled(False)
+        self.use_btn.clicked.connect(self.accept)
+        buttons.addWidget(self.use_btn)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+
+    def _on_calibrated(self, result):
+        self.result_calibration = result
+        self.use_btn.setEnabled(True)
 
 
 if __name__ == "__main__":

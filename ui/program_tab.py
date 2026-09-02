@@ -20,10 +20,12 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QListWidgetItem, QGraphicsView, QGraphicsScene,
     QLabel, QPushButton, QDoubleSpinBox, QFormLayout, QFileDialog,
-    QMessageBox, QGroupBox
+    QMessageBox, QGroupBox, QInputDialog
 )
-from PyQt5.QtCore import Qt, QRectF
+from PyQt5.QtCore import Qt, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QPen, QBrush, QPainter
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 PX_PER_MM = 40
@@ -118,11 +120,16 @@ def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0)):
 
 
 class ProgramTab(QWidget):
+    # Emitted with (program dict, part_sizes dict) when a program becomes
+    # the active one for Live Inspection.
+    program_activated = pyqtSignal(object, object)
+
     def __init__(self, programs_dir="programs", part_sizes_path="programs/part_sizes.json"):
         super().__init__()
         self.programs_dir = programs_dir
         self.part_sizes_path = part_sizes_path
         self.program = None
+        self.program_path = None
         self.part_sizes = self._load_part_sizes()
         self.current_part = None
         self.current_rect_item = None
@@ -159,12 +166,22 @@ class ProgramTab(QWidget):
 
         # Left column: load program + part list
         left = QVBoxLayout()
+        self.import_btn = QPushButton("Import XY File...")
+        self.import_btn.clicked.connect(self.import_xy_dialog)
+        left.addWidget(self.import_btn)
+
         self.load_btn = QPushButton("Load Program JSON")
         self.load_btn.clicked.connect(self.load_program_dialog)
         left.addWidget(self.load_btn)
 
         self.program_label = QLabel("No program loaded")
+        self.program_label.setWordWrap(True)
         left.addWidget(self.program_label)
+
+        self.activate_btn = QPushButton("Set Active for Inspection")
+        self.activate_btn.setEnabled(False)
+        self.activate_btn.clicked.connect(self.activate_program)
+        left.addWidget(self.activate_btn)
 
         self.part_list = QListWidget()
         self.part_list.currentItemChanged.connect(self.on_part_selected)
@@ -217,6 +234,38 @@ class ProgramTab(QWidget):
         root.addLayout(right, stretch=3)
 
     # ---------- program loading ----------
+    def import_xy_dialog(self):
+        """Parse a mounter XY export into a new program JSON."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import mounter XY file", "", "Excel files (*.xlsx *.xls)"
+        )
+        if not path:
+            return
+        default_name = Path(path).stem
+        name, ok = QInputDialog.getText(self, "Program name", "Name for this program:",
+                                         text=default_name)
+        if not ok or not name.strip():
+            return
+
+        from core.program_parser import parse_program, save_program
+        try:
+            program = parse_program(path, name.strip())
+            out_path = save_program(program, self.programs_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import failed", f"Could not parse {Path(path).name}:\n{exc}")
+            return
+
+        unsized = [p for p in program["unknown_parts"] if p not in self.part_sizes]
+        QMessageBox.information(
+            self, "Program imported",
+            f"Saved to {out_path}\n\n"
+            f"Components: {len(program['components'])}\n"
+            f"Fiducials: {len(program['fiducials'])}\n"
+            f"Panel offsets: {len(program['panel_offsets'])}\n"
+            f"Part numbers still needing an ROI size: {len(unsized)}"
+        )
+        self.load_program(out_path)
+
     def load_program_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Program JSON", self.programs_dir, "JSON files (*.json)"
@@ -227,11 +276,26 @@ class ProgramTab(QWidget):
     def load_program(self, path):
         with open(path) as f:
             self.program = json.load(f)
+        self.program_path = path
         self.program_label.setText(
             f"{self.program['name']}  |  {len(self.program['components'])} components"
         )
+        self.activate_btn.setEnabled(True)
         self._populate_part_list()
         self._draw_overview()
+
+    def activate_program(self):
+        """Hand this program to the Live Inspection tab. Sizes are saved
+        first so the inspection uses what is on screen, not the last
+        explicitly-saved state."""
+        if not self.program:
+            return
+        self._save_part_sizes()
+        self.program_activated.emit(self.program, self.part_sizes)
+        self.program_label.setText(
+            f"{self.program['name']}  |  {len(self.program['components'])} components"
+            f"  |  <b>ACTIVE</b>"
+        )
 
     def _populate_part_list(self):
         self.part_list.clear()
