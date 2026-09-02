@@ -11,6 +11,8 @@ TESTS = [
     "test_calibration.py",
     "test_inspection.py",
     "test_barcode_and_log.py",
+    "test_fiducials.py",
+    "test_tuning_and_editing.py",
     "test_reference_image.py",
     "test_program_tab_smoke.py",
     "test_program_tab_reference_smoke.py",

@@ -54,7 +54,8 @@ def make_synthetic_board_frame(
     return frame, px
 
 
-def draw_components(frame, components, homography, part_sizes, missing_designators=()):
+def draw_components(frame, components, homography, part_sizes, missing_designators=(),
+                    contrast=1.0):
     """Draw component bodies onto a synthetic board frame at the pixel
     positions implied by `homography`, skipping any designator listed in
     `missing_designators` so its pad is left bare. Populated parts get a
@@ -62,9 +63,19 @@ def draw_components(frame, components, homography, part_sizes, missing_designato
     get a flat low-contrast patch, which is what the presence heuristic
     is meant to tell apart.
 
+    `contrast` scales how far the body and terminations sit from the
+    board colour: 1.0 is a boldly visible part, lower values approach a
+    subtle one that the presence heuristic finds genuinely hard.
+
     Mutates and returns `frame`.
     """
     from core.inspection import project_local_points
+
+    board = np.array([60, 130, 60], dtype=np.float64)
+
+    def shade(colour):
+        c = board + (np.asarray(colour, dtype=np.float64) - board) * float(contrast)
+        return tuple(int(round(v)) for v in np.clip(c, 0, 255))
 
     def fill(local_quad, colour, comp):
         pts = project_local_points(homography, comp["x"], comp["y"],
@@ -90,12 +101,13 @@ def draw_components(frame, components, homography, part_sizes, missing_designato
             fill(body, (70, 140, 70), c)   # bare pad: flat, close to the solder mask
             continue
 
-        fill(body, (35, 35, 40), c)                                    # dark body
+        fill(body, shade((35, 35, 40)), c)                             # dark body
         term = max(w_mm / 5.0, 0.05)
-        fill([(-hw, -hh), (-hw + term, -hh), (-hw + term, hh), (-hw, hh)], (200, 200, 205), c)
-        fill([(hw - term, -hh), (hw, -hh), (hw, hh), (hw - term, hh)], (200, 200, 205), c)
+        light = shade((200, 200, 205))
+        fill([(-hw, -hh), (-hw + term, -hh), (-hw + term, hh), (-hw, hh)], light, c)
+        fill([(hw - term, -hh), (hw, -hh), (hw, hh), (hw - term, hh)], light, c)
         fill([(-hw, -hh * 0.12), (hw, -hh * 0.12), (hw, hh * 0.12), (-hw, hh * 0.12)],
-             (120, 120, 125), c)                                       # body marking
+             shade((120, 120, 125)), c)                                # body marking
     return frame
 
 

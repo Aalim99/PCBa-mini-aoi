@@ -45,10 +45,12 @@ class PresenceThresholds:
     """Presence heuristic tuning. These defaults are placeholders --
     they MUST be re-tuned against real captures of a known-good and a
     known-missing board, since the right numbers depend on lighting,
-    solder mask colour and component finish."""
+    solder mask colour and component finish. The Live tab's sensitivity
+    slider and per-part overrides exist to do exactly that tuning."""
     std_min: float = 8.0        # grayscale std dev inside the ROI
     range_min: float = 25.0     # robust intensity range (p95 - p5)
     mode: str = "and"           # "and" = stricter (favours false FAIL over false PASS)
+    sensitivity: float = 1.0    # global multiplier over both thresholds
 
 
 @dataclass
@@ -63,10 +65,26 @@ class ComponentResult:
     intensity_range: float = 0.0
     present: bool = False
     status: str = "checked"     # checked | unsized | off_frame
+    # Thresholds this component was actually judged against, so the UI
+    # can show how close a call was and re-decide without re-capturing.
+    std_min: float = 0.0
+    range_min: float = 0.0
 
     @property
     def missing(self) -> bool:
         return self.status == "checked" and not self.present
+
+    @property
+    def margin(self) -> float:
+        """How comfortably the call was made: >= 1 means present with
+        room to spare, < 1 means it fell short. The smallest of the two
+        ratios governs, since both must clear in "and" mode."""
+        ratios = []
+        if self.std_min > 0:
+            ratios.append(self.std / self.std_min)
+        if self.range_min > 0:
+            ratios.append(self.intensity_range / self.range_min)
+        return min(ratios) if ratios else 0.0
 
 
 @dataclass
@@ -244,18 +262,29 @@ def crop_roi(gray: np.ndarray, roi: Tuple[float, float, float, float]) -> Option
     return gray[cy0:cy1, cx0:cx1]
 
 
-def check_presence(crop: np.ndarray, thresholds: PresenceThresholds) -> Tuple[bool, float, float]:
-    """Heuristic populated-vs-bare decision for one ROI crop: a
-    populated pad carries a component body and its edges, so it varies;
-    a bare pad is comparatively flat. Returns (present, std, range)."""
+def measure_roi(crop: np.ndarray) -> Tuple[float, float]:
+    """The two numbers the presence heuristic decides on: how much the
+    ROI varies, and its robust intensity range. A populated pad carries
+    a component body and its edges so it varies; a bare pad is
+    comparatively flat."""
     std = float(np.std(crop))
     p5, p95 = np.percentile(crop, [5, 95])
-    rng = float(p95 - p5)
+    return std, float(p95 - p5)
 
-    std_ok = std >= thresholds.std_min
-    range_ok = rng >= thresholds.range_min
-    present = (std_ok and range_ok) if thresholds.mode == "and" else (std_ok or range_ok)
-    return present, std, rng
+
+def decide_presence(std: float, intensity_range: float, std_min: float,
+                    range_min: float, mode: str = "and") -> bool:
+    std_ok = std >= std_min
+    range_ok = intensity_range >= range_min
+    return (std_ok and range_ok) if mode == "and" else (std_ok or range_ok)
+
+
+def check_presence(crop: np.ndarray, thresholds: PresenceThresholds) -> Tuple[bool, float, float]:
+    """Measure and decide in one step, against the global thresholds."""
+    std, rng = measure_roi(crop)
+    std_min = thresholds.std_min * thresholds.sensitivity
+    range_min = thresholds.range_min * thresholds.sensitivity
+    return decide_presence(std, rng, std_min, range_min, thresholds.mode), std, rng
 
 
 # ---------------------------------------------------------------------
@@ -266,6 +295,46 @@ def to_gray(frame: np.ndarray) -> np.ndarray:
     return frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
+def _verdict_for(units: List[UnitResult]) -> Tuple[str, str]:
+    missing = [c for u in units for c in u.missing]
+    unchecked = [c for u in units for c in u.unchecked]
+    if missing:
+        return "FAIL", (f"{len(missing)} missing component(s) across "
+                        f"{sum(1 for u in units if u.missing)} unit(s).")
+    if unchecked:
+        return "INCOMPLETE", (f"No missing components found, but {len(unchecked)} component(s) "
+                              f"could not be checked (unsized part or ROI off frame).")
+    return "PASS", f"All {sum(len(u.components) for u in units)} components present."
+
+
+def reevaluate(result: InspectionResult, thresholds: PresenceThresholds,
+               part_thresholds: Optional[Dict[str, dict]] = None) -> InspectionResult:
+    """Re-decide an existing result against different thresholds, using
+    the measurements already taken.
+
+    This is what makes tuning practical: the operator moves the
+    sensitivity slider, or marks a false call, and the verdict updates
+    on the very capture in front of them -- no re-shoot, and no chance
+    of the board having shifted between the two judgements.
+    """
+    from core.thresholds import effective_thresholds
+
+    for unit in result.units:
+        for comp in unit.components:
+            if comp.status != "checked":
+                continue
+            std_min, range_min = effective_thresholds(
+                comp.part, thresholds.std_min, thresholds.range_min,
+                part_thresholds, thresholds.sensitivity,
+            )
+            comp.std_min, comp.range_min = std_min, range_min
+            comp.present = decide_presence(comp.std, comp.intensity_range,
+                                           std_min, range_min, thresholds.mode)
+
+    result.verdict, result.message = _verdict_for(result.units)
+    return result
+
+
 def inspect(
     frame: np.ndarray,
     program: dict,
@@ -274,6 +343,7 @@ def inspect(
     thresholds: Optional[PresenceThresholds] = None,
     panel_mode: Optional[str] = None,
     barcode: Optional[str] = None,
+    part_thresholds: Optional[Dict[str, dict]] = None,
 ) -> InspectionResult:
     """Run one inspection pass over a captured frame.
 
@@ -282,6 +352,8 @@ def inspect(
     than assumed good -- a board with unchecked components can never
     come back a clean PASS.
     """
+    from core.thresholds import effective_thresholds
+
     thresholds = thresholds or PresenceThresholds()
     gray = to_gray(frame)
     mode = panel_mode or detect_panel_mode(program)
@@ -318,24 +390,18 @@ def inspect(
             unit.components.append(result)
             continue
 
-        present, std, rng = check_presence(crop, thresholds)
-        result.present, result.std, result.intensity_range = present, std, rng
+        std, rng = measure_roi(crop)
+        std_min, range_min = effective_thresholds(
+            part, thresholds.std_min, thresholds.range_min,
+            part_thresholds, thresholds.sensitivity,
+        )
+        result.std, result.intensity_range = std, rng
+        result.std_min, result.range_min = std_min, range_min
+        result.present = decide_presence(std, rng, std_min, range_min, thresholds.mode)
         unit.components.append(result)
 
     ordered = [units[k] for k in sorted(units.keys())]
-    missing = [c for u in ordered for c in u.missing]
-    unchecked = [c for u in ordered for c in u.unchecked]
-
-    if missing:
-        verdict = "FAIL"
-        message = f"{len(missing)} missing component(s) across {sum(1 for u in ordered if u.missing)} unit(s)."
-    elif unchecked:
-        verdict = "INCOMPLETE"
-        message = (f"No missing components found, but {len(unchecked)} component(s) could not be "
-                   f"checked (unsized part or ROI off frame).")
-    else:
-        verdict = "PASS"
-        message = f"All {sum(len(u.components) for u in ordered)} components present."
+    verdict, message = _verdict_for(ordered)
 
     return InspectionResult(
         verdict=verdict, units=ordered, barcode=barcode,
