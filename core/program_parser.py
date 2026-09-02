@@ -19,7 +19,6 @@ Output is a plain dict, ready to be saved as programs/<name>.json
 """
 
 import pandas as pd
-import numpy as np
 import json
 from pathlib import Path
 from datetime import datetime

@@ -50,7 +50,7 @@ from core.thresholds import (
     save_part_thresholds, thresholds_for_false_call,
 )
 from ui.calibration_widget import ImageCanvas, CalibrationDialog
-from ui.theme import COLORS, Card, muted_label, restyle, verdict_style
+from ui.theme import COLORS, Card, muted_label, verdict_style
 
 SLIDER_STEPS = 100
 

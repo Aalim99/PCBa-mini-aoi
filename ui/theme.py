@@ -22,7 +22,7 @@ changing one (see `restyle`).
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QFrame, QLabel, QVBoxLayout
 
 COLORS = {
     "bg": "#12151a",

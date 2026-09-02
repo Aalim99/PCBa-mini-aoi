@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QListWidgetItem, QGraphicsView, QGraphicsScene,
     QLabel, QLineEdit, QPushButton, QDoubleSpinBox, QFormLayout, QFileDialog,
-    QMessageBox, QGroupBox, QInputDialog, QGraphicsPixmapItem
+    QMessageBox, QInputDialog, QGraphicsPixmapItem
 )
 from PyQt5.QtCore import Qt, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QPen, QBrush, QPainter, QImage, QPixmap

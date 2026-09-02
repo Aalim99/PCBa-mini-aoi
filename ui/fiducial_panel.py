@@ -21,8 +21,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import cv2
-import numpy as np
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
     QVBoxLayout, QWidget,

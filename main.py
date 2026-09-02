@@ -16,7 +16,7 @@ Run:
 import sys
 from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ui.live_tab import LiveTab

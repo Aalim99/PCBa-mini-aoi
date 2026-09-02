@@ -16,7 +16,6 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLineEdit, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QFileDialog,
 )
-from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
