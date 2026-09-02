@@ -1,14 +1,20 @@
 """
 live_tab.py
 
-The Live Inspection tab: live camera view, calibrate against the active
+The Live Inspection tab: live camera view, align the board against the
 program's fiducials, then trigger a single-frame capture + inspection
 pass on operator command (button or Space) -- not continuous
 frame-by-frame checking.
 
-Shows PASS/FAIL/INCOMPLETE with the missing-component list, overlays
-every ROI on the captured frame, reads the traceability barcode from
-the same frame, and appends the result to the CSV log.
+Alignment prefers the fiducials taught in Program Manager (F1/F2/F3 by
+appearance and geometry), falls back to blob detection, then to manual
+clicking. Whichever path ran is named on screen, because how the board
+was aligned changes how much to trust a marginal call.
+
+Tuning lives here rather than in a settings file: the sensitivity slider
+and the "part is present" action re-decide the capture already on
+screen, so the operator sees the effect of a change on the board that
+provoked it.
 
 Run standalone for testing:
     python ui/live_tab.py
@@ -24,8 +30,8 @@ import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QMessageBox, QGroupBox, QListWidget, QComboBox, QFileDialog,
-    QShortcut,
+    QPushButton, QMessageBox, QListWidget, QListWidgetItem, QComboBox,
+    QFileDialog, QShortcut, QSlider, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
@@ -33,144 +39,260 @@ from PyQt5.QtGui import QKeySequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.calibration import CalibrationResult, auto_calibrate
 from core.camera import Camera, StillImageSource, list_cameras
-from core.inspection import InspectionResult, PresenceThresholds, expanded_fiducials_mm, inspect
+from core.fiducials import align_with_templates, get_fiducial_refs, load_templates
+from core.inspection import (
+    InspectionResult, PresenceThresholds, expanded_fiducials_mm, inspect, reevaluate,
+)
 from core.barcode_reader import read_barcode
 from core.result_log import append_result
+from core.thresholds import (
+    MAX_SENSITIVITY, MIN_SENSITIVITY, clamp_sensitivity, load_part_thresholds,
+    save_part_thresholds, thresholds_for_false_call,
+)
 from ui.calibration_widget import ImageCanvas, CalibrationDialog
+from ui.theme import COLORS, Card, muted_label, restyle, verdict_style
 
-VERDICT_STYLES = {
-    "PASS": "background:#1b7f3b; color:white;",
-    "FAIL": "background:#b3261e; color:white;",
-    "INCOMPLETE": "background:#a8730a; color:white;",
-    "": "background:#555; color:white;",
-}
+SLIDER_STEPS = 100
+
+
+def _sensitivity_from_slider(value: int) -> float:
+    """Slider position -> multiplier, spread logarithmically so the fine
+    detail sits around 1.0 where tuning actually happens."""
+    frac = value / SLIDER_STEPS
+    return float(np.exp(np.log(MIN_SENSITIVITY) + frac * (np.log(MAX_SENSITIVITY) - np.log(MIN_SENSITIVITY))))
+
+
+def _slider_from_sensitivity(sensitivity: float) -> int:
+    sensitivity = clamp_sensitivity(sensitivity)
+    frac = (np.log(sensitivity) - np.log(MIN_SENSITIVITY)) / (np.log(MAX_SENSITIVITY) - np.log(MIN_SENSITIVITY))
+    return int(round(frac * SLIDER_STEPS))
 
 
 class LiveTab(QWidget):
     inspected = pyqtSignal(object)  # InspectionResult, so the logs tab can refresh
 
-    def __init__(self, log_path="logs/results.csv"):
+    def __init__(self, log_path="logs/results.csv", programs_dir="programs",
+                 part_thresholds_path="programs/part_thresholds.json"):
         super().__init__()
         self.log_path = log_path
+        self.programs_dir = programs_dir
+        self.part_thresholds_path = part_thresholds_path
         self.program: Optional[dict] = None
         self.part_sizes = {}
+        self.part_thresholds = load_part_thresholds(part_thresholds_path)
         self.calibration: Optional[CalibrationResult] = None
+        self.fiducial_templates = {}
         self.source = None
         self.cameras = []
         self.live_frame: Optional[np.ndarray] = None
+        self.captured_frame: Optional[np.ndarray] = None
         self.last_result: Optional[InspectionResult] = None
         self.thresholds = PresenceThresholds()
         # After a pass the view holds the annotated capture so the
-        # operator can actually read it; frames keep being captured
-        # underneath so the next trigger still inspects a fresh one.
+        # operator can read it; frames keep being captured underneath so
+        # the next trigger still inspects a fresh one.
         self._frozen = False
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._grab_frame)
 
         self._build_ui()
-        # Scan after the window has painted: probing absent device indices
-        # takes a moment, and blocking startup on it looks like a hang.
         QTimer.singleShot(150, lambda: self.scan_cameras(show_result=False))
 
     # ---------- UI ----------
     def _build_ui(self):
         root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+        root.addLayout(self._build_viewer(), stretch=5)
+        root.addLayout(self._build_sidebar(), stretch=2)
 
-        left = QVBoxLayout()
+    def _build_viewer(self):
+        column = QVBoxLayout()
+        column.setSpacing(10)
+
         self.canvas = ImageCanvas()
-        left.addWidget(self.canvas, stretch=1)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        column.addWidget(self.canvas, stretch=1)
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Camera:"))
+        source_card = Card("Source")
+        row = QHBoxLayout()
+        row.setSpacing(8)
         self.camera_combo = QComboBox()
         self.camera_combo.setMinimumWidth(230)
         self.camera_combo.addItem("(not scanned yet)", None)
-        controls.addWidget(self.camera_combo)
+        row.addWidget(self.camera_combo, stretch=1)
 
         self.rescan_btn = QPushButton("Rescan")
+        self.rescan_btn.setProperty("variant", "ghost")
         self.rescan_btn.clicked.connect(self.scan_cameras)
-        controls.addWidget(self.rescan_btn)
+        row.addWidget(self.rescan_btn)
 
         self.start_btn = QPushButton("Start Live")
         self.start_btn.clicked.connect(self.toggle_live)
-        controls.addWidget(self.start_btn)
+        row.addWidget(self.start_btn)
 
-        self.still_btn = QPushButton("Load Still Image...")
+        self.still_btn = QPushButton("Open Image...")
+        self.still_btn.setProperty("variant", "ghost")
         self.still_btn.clicked.connect(self.load_still_image)
-        controls.addWidget(self.still_btn)
-
-        self.calibrate_btn = QPushButton("Calibrate")
-        self.calibrate_btn.clicked.connect(self.calibrate)
-        controls.addWidget(self.calibrate_btn)
+        row.addWidget(self.still_btn)
 
         self.resume_btn = QPushButton("Resume Live")
+        self.resume_btn.setProperty("variant", "ghost")
         self.resume_btn.setEnabled(False)
         self.resume_btn.clicked.connect(self.resume_live)
-        controls.addWidget(self.resume_btn)
+        row.addWidget(self.resume_btn)
+        source_card.body.addLayout(row)
+        column.addWidget(source_card)
 
-        self.inspect_btn = QPushButton("INSPECT (Space)")
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        self.calibrate_btn = QPushButton("Align Board")
+        self.calibrate_btn.setProperty("variant", "primary")
+        self.calibrate_btn.setMinimumHeight(44)
+        self.calibrate_btn.clicked.connect(self.calibrate)
+        actions.addWidget(self.calibrate_btn, stretch=2)
+
+        self.inspect_btn = QPushButton("INSPECT   (Space)")
+        self.inspect_btn.setProperty("variant", "trigger")
+        self.inspect_btn.setMinimumHeight(44)
         self.inspect_btn.clicked.connect(self.run_inspection)
-        controls.addWidget(self.inspect_btn, stretch=1)
-        left.addLayout(controls)
-        root.addLayout(left, stretch=3)
-
-        right = QVBoxLayout()
-        self.verdict_label = QLabel("NO RESULT")
-        self.verdict_label.setAlignment(Qt.AlignCenter)
-        self.verdict_label.setStyleSheet(VERDICT_STYLES[""] + "font-size:26px; font-weight:bold; padding:16px;")
-        right.addWidget(self.verdict_label)
-
-        self.program_label = QLabel("No active program")
-        self.program_label.setWordWrap(True)
-        right.addWidget(self.program_label)
-
-        self.calib_label = QLabel("Not calibrated")
-        self.calib_label.setWordWrap(True)
-        right.addWidget(self.calib_label)
-
-        self.barcode_label = QLabel("Barcode: -")
-        right.addWidget(self.barcode_label)
-
-        missing_box = QGroupBox("Missing / unchecked")
-        box_layout = QVBoxLayout()
-        self.missing_list = QListWidget()
-        box_layout.addWidget(self.missing_list)
-        missing_box.setLayout(box_layout)
-        right.addWidget(missing_box, stretch=1)
-
-        self.units_label = QLabel("")
-        self.units_label.setWordWrap(True)
-        right.addWidget(self.units_label)
-
-        root.addLayout(right, stretch=2)
+        actions.addWidget(self.inspect_btn, stretch=3)
+        column.addLayout(actions)
 
         trigger = QShortcut(QKeySequence(Qt.Key_Space), self)
         trigger.activated.connect(self.run_inspection)
+        return column
+
+    def _build_sidebar(self):
+        column = QVBoxLayout()
+        column.setSpacing(12)
+
+        self.verdict_label = QLabel("READY")
+        self.verdict_label.setAlignment(Qt.AlignCenter)
+        self.verdict_label.setMinimumHeight(84)
+        self._style_verdict("")
+        column.addWidget(self.verdict_label)
+
+        status = Card("Board")
+        self.program_label = muted_label("No active program")
+        self.calib_label = muted_label("Not aligned")
+        self.barcode_label = muted_label("Barcode: -")
+        status.body.addWidget(self.program_label)
+        status.body.addWidget(self.calib_label)
+        status.body.addWidget(self.barcode_label)
+        column.addWidget(status)
+
+        findings = Card("Findings")
+        self.units_label = muted_label("")
+        findings.body.addWidget(self.units_label)
+        self.missing_list = QListWidget()
+        self.missing_list.currentItemChanged.connect(self._on_finding_selected)
+        findings.body.addWidget(self.missing_list, stretch=1)
+
+        self.accept_btn = QPushButton("This part IS present  (false call)")
+        self.accept_btn.setProperty("variant", "ghost")
+        self.accept_btn.setEnabled(False)
+        self.accept_btn.setToolTip(
+            "Tell the station a component it called missing is actually fitted.\n"
+            "Lowers the threshold for that part number only, and re-decides\n"
+            "the capture on screen straight away."
+        )
+        self.accept_btn.clicked.connect(self.accept_false_call)
+        findings.body.addWidget(self.accept_btn)
+        column.addWidget(findings, stretch=1)
+
+        tuning = Card("Sensitivity")
+        self.sensitivity_label = muted_label("")
+        tuning.body.addWidget(self.sensitivity_label)
+
+        self.sensitivity_slider = QSlider(Qt.Horizontal)
+        self.sensitivity_slider.setRange(0, SLIDER_STEPS)
+        self.sensitivity_slider.setValue(_slider_from_sensitivity(1.0))
+        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
+        tuning.body.addWidget(self.sensitivity_slider)
+
+        scale_row = QHBoxLayout()
+        left = QLabel("fewer false calls")
+        left.setProperty("variant", "muted")
+        right = QLabel("stricter")
+        right.setProperty("variant", "muted")
+        right.setAlignment(Qt.AlignRight)
+        scale_row.addWidget(left)
+        scale_row.addWidget(right)
+        tuning.body.addLayout(scale_row)
+
+        buttons = QHBoxLayout()
+        self.reset_tuning_btn = QPushButton("Reset")
+        self.reset_tuning_btn.setProperty("variant", "ghost")
+        self.reset_tuning_btn.clicked.connect(self.reset_tuning)
+        buttons.addWidget(self.reset_tuning_btn)
+        self.save_tuning_btn = QPushButton("Save Tuning")
+        self.save_tuning_btn.clicked.connect(self.save_tuning)
+        buttons.addWidget(self.save_tuning_btn)
+        tuning.body.addLayout(buttons)
+        column.addWidget(tuning)
+
+        self._update_sensitivity_label()
+        return column
+
+    def _style_verdict(self, verdict):
+        fg, bg = verdict_style(verdict)
+        self.verdict_label.setStyleSheet(
+            f"background:{bg}; color:{fg}; border:2px solid {fg}; border-radius:10px;"
+            f"font-size:30px; font-weight:800; letter-spacing:2px;"
+        )
 
     # ---------- program wiring ----------
     def set_program(self, program: dict, part_sizes: dict):
-        """Called when the Program Manager tab activates a program.
-        Calibration is dropped, since it belongs to the previous board."""
+        """Called when Program Manager activates a program. Alignment is
+        dropped, since it belonged to the previous board."""
         self.program = program
         self.part_sizes = dict(part_sizes or {})
         self.calibration = None
+        self.fiducial_templates = {}
+        if program:
+            self.fiducial_templates = load_templates(program.get("name", ""), self.programs_dir)
         self._set_calibration_label()
-        fid_count = len(expanded_fiducials_mm(program)) if program else 0
+
+        if not program:
+            self.program_label.setText("No active program")
+            return
+        refs = get_fiducial_refs(program)
+        taught = sum(1 for r in refs if r.id in self.fiducial_templates)
+        if refs:
+            fid_note = (f"{len(refs)} defined ({', '.join(r.id for r in refs)}), "
+                        f"{taught} taught")
+        else:
+            fid_note = f"{len(expanded_fiducials_mm(program))} from the XY file, none defined"
         self.program_label.setText(
-            f"Active program: <b>{program.get('name', '?')}</b><br>"
-            f"{len(program.get('components') or [])} component rows, {fid_count} fiducials"
-            if program else "No active program"
+            f"<b>{program.get('name', '?')}</b><br>"
+            f"{len(program.get('components') or [])} components<br>"
+            f"<span style='color:{COLORS['faint']}'>Fiducials: {fid_note}</span>"
         )
 
     def _set_calibration_label(self):
         if self.calibration and self.calibration.success:
+            how = {"template": "taught fiducials", "auto": "auto-detect",
+                   "manual": "manual clicks"}.get(self.calibration.method, self.calibration.method)
+            # A 2- or 3-point fit is exact by construction, so quoting its
+            # RMS would read as accuracy it cannot have. Show the match
+            # score instead, which does say how well the marks were found.
+            if self.calibration.rms_is_meaningful:
+                quality = f"RMS {self.calibration.rms_error_px:.2f}px"
+            elif self.calibration.match_score:
+                quality = f"match {self.calibration.match_score:.2f}"
+            else:
+                quality = f"exact {self.calibration.inlier_count}-point fit"
             self.calib_label.setText(
-                f"<b>Calibrated</b> ({self.calibration.method}): "
-                f"{self.calibration.inlier_count} fiducials, RMS {self.calibration.rms_error_px:.2f}px"
+                f"<span style='color:{COLORS['pass']}'><b>Aligned</b></span> via {how} - "
+                f"{self.calibration.inlier_count} points, {quality}"
             )
         else:
-            self.calib_label.setText("<b>Not calibrated</b> - press Calibrate before inspecting")
+            self.calib_label.setText(
+                f"<span style='color:{COLORS['warn']}'><b>Not aligned</b></span> - "
+                f"press Align Board before inspecting"
+            )
 
     # ---------- camera ----------
     def scan_cameras(self, show_result=True):
@@ -202,8 +324,7 @@ class LiveTab(QWidget):
                 "No working camera was found on indices 0-5.\n\n"
                 "Check that the camera is plugged in and not in use by another "
                 "application (Teams, Zoom, the Windows Camera app), then press "
-                "Rescan. You can also use 'Load Still Image...' to work from a "
-                "saved capture."
+                "Rescan. You can also use 'Open Image...' to work from a saved capture."
             )
         return cameras
 
@@ -214,7 +335,6 @@ class LiveTab(QWidget):
 
         index = self.camera_combo.currentData()
         if index is None:
-            # Nothing chosen yet (first run, or the last scan found nothing).
             cameras = self.scan_cameras(show_result=False)
             if not cameras:
                 QMessageBox.warning(
@@ -222,7 +342,7 @@ class LiveTab(QWidget):
                     "No working camera was found on indices 0-5.\n\n"
                     "Check the camera is plugged in and not already in use by "
                     "another application, then press Rescan -- or use "
-                    "'Load Still Image...' to work from a saved capture."
+                    "'Open Image...' to work from a saved capture."
                 )
                 return
             index = self.camera_combo.currentData()
@@ -232,14 +352,12 @@ class LiveTab(QWidget):
             detected = ", ".join(str(c["index"]) for c in self.cameras) or "none"
             QMessageBox.warning(
                 self, "Could not open camera",
-                f"Camera {index} did not open.\n\n"
-                f"Currently detected: {detected}.\n"
+                f"Camera {index} did not open.\n\nCurrently detected: {detected}.\n"
                 "It may have been unplugged or claimed by another application. "
                 "Press Rescan to refresh the list."
             )
             return
         self.set_source(cam)
-        self.calib_label.setToolTip(f"Live source: {cam.description}")
 
     def set_source(self, source):
         self.stop_live()
@@ -259,7 +377,7 @@ class LiveTab(QWidget):
         self.start_btn.setText("Start Live")
 
     def load_still_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load frame", "",
+        path, _ = QFileDialog.getOpenFileName(self, "Open frame", "",
                                                "Images (*.png *.jpg *.jpeg *.bmp *.tif)")
         if path:
             self.set_source(StillImageSource(path=path))
@@ -283,34 +401,6 @@ class LiveTab(QWidget):
         if self.live_frame is not None:
             self.canvas.set_frame(self.live_frame)
 
-    # ---------- calibration ----------
-    def calibrate(self):
-        if not self._require(self.program, "Load a program in the Program Manager tab first."):
-            return
-        frame = self.current_frame()
-        if not self._require(frame is not None, "No frame available - start the camera or load a still image."):
-            return
-
-        fiducials_mm = expanded_fiducials_mm(self.program)
-        if not self._require(len(fiducials_mm) >= 2,
-                             "This program has fewer than 2 fiducials, so the board cannot be aligned."):
-            return
-
-        result = auto_calibrate(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), fiducials_mm)
-        if result.success:
-            # No confirmation popup: the operator calibrates then inspects
-            # immediately, and the status label already reports the result.
-            self.calibration = result
-            self._set_calibration_label()
-            return
-
-        # Auto-detect failed or was ambiguous -> manual click fallback.
-        dialog = CalibrationDialog(frame, fiducials_mm, parent=self)
-        dialog.widget.status_label.setText("Auto-detect: " + result.message)
-        if dialog.exec_() == dialog.Accepted and dialog.result_calibration:
-            self.calibration = dialog.result_calibration
-        self._set_calibration_label()
-
     def current_frame(self) -> Optional[np.ndarray]:
         if self.live_frame is not None:
             return self.live_frame
@@ -318,26 +408,75 @@ class LiveTab(QWidget):
             return self.source.read()
         return None
 
+    # ---------- alignment ----------
+    def calibrate(self):
+        """Align the board. Taught fiducials first (specific marks, known
+        geometry), then blob detection, then manual clicking."""
+        if not self._require(self.program, "Load a program in the Program Manager tab first."):
+            return
+        frame = self.current_frame()
+        if not self._require(frame is not None,
+                             "No frame available - start the camera or open an image."):
+            return
+
+        refs = get_fiducial_refs(self.program)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        attempts = []
+
+        if refs and self.fiducial_templates:
+            result = align_with_templates(frame, refs, self.fiducial_templates)
+            if result.success:
+                self._accept_calibration(result)
+                return
+            attempts.append(f"taught fiducials: {result.message}")
+
+        fallback_points = ([(r.x_mm, r.y_mm) for r in refs] if refs
+                           else expanded_fiducials_mm(self.program))
+        if not self._require(len(fallback_points) >= 2,
+                             "This program has fewer than 2 fiducials, so the board cannot "
+                             "be aligned. Define them in Program Manager."):
+            return
+
+        result = auto_calibrate(gray, fallback_points)
+        if result.success:
+            self._accept_calibration(result)
+            return
+        attempts.append(f"auto-detect: {result.message}")
+
+        # Manual clicking, in the order the fiducials are defined.
+        labels = [r.id for r in refs] if refs else None
+        dialog = CalibrationDialog(frame, fallback_points, parent=self, labels=labels)
+        dialog.widget.status_label.setText(" | ".join(attempts))
+        if dialog.exec_() == dialog.Accepted and dialog.result_calibration:
+            self._accept_calibration(dialog.result_calibration)
+        else:
+            self._set_calibration_label()
+
+    def _accept_calibration(self, result):
+        self.calibration = result
+        self._set_calibration_label()
+
     # ---------- inspection ----------
     def run_inspection(self):
         if not self._require(self.program, "No active program."):
             return
         if not self._require(self.calibration and self.calibration.success,
-                             "Board is not calibrated yet - press Calibrate first."):
+                             "Board is not aligned yet - press Align Board first."):
             return
         frame = self.current_frame()
         if not self._require(frame is not None, "No frame to inspect."):
             return
 
         frame = frame.copy()  # freeze this capture; live view keeps moving
+        self.captured_frame = frame
         barcode = read_barcode(frame)
         result = inspect(frame, self.program, self.part_sizes, self.calibration.homography,
-                         thresholds=self.thresholds, barcode=barcode)
+                         thresholds=self.thresholds, barcode=barcode,
+                         part_thresholds=self.part_thresholds)
         self.last_result = result
 
         self._frozen = True
         self.resume_btn.setEnabled(True)
-        self.canvas.set_frame(self._overlay(frame, result))
         self._show_result(result)
 
         try:
@@ -349,6 +488,9 @@ class LiveTab(QWidget):
 
     def _overlay(self, frame, result: InspectionResult):
         out = frame.copy()
+        # alignment points first, so they sit under the component boxes
+        for (x, y) in (self.calibration.matched_px if self.calibration else []):
+            cv2.drawMarker(out, (int(x), int(y)), (255, 200, 0), cv2.MARKER_TILTED_CROSS, 22, 2)
         for unit in result.units:
             for comp in unit.components:
                 if comp.roi_px is None:
@@ -368,23 +510,108 @@ class LiveTab(QWidget):
 
     def _show_result(self, result: InspectionResult):
         self.verdict_label.setText(result.verdict)
-        self.verdict_label.setStyleSheet(
-            VERDICT_STYLES.get(result.verdict, VERDICT_STYLES[""])
-            + "font-size:26px; font-weight:bold; padding:16px;"
-        )
+        self._style_verdict(result.verdict)
         self.barcode_label.setText(f"Barcode: {result.barcode or '(unreadable)'}")
+
+        if self.captured_frame is not None:
+            self.canvas.set_frame(self._overlay(self.captured_frame, result))
 
         self.missing_list.clear()
         for comp in result.missing:
-            self.missing_list.addItem(f"MISSING  {comp.unit}:{comp.designator}  ({comp.part})")
+            item = QListWidgetItem(
+                f"MISSING   {comp.unit}:{comp.designator}   {comp.part or '-'}"
+                f"      {comp.margin:.2f}x"
+            )
+            item.setData(Qt.UserRole, comp)
+            item.setToolTip(
+                f"Measured variation {comp.std:.1f} (needs {comp.std_min:.1f}), "
+                f"range {comp.intensity_range:.1f} (needs {comp.range_min:.1f}).\n"
+                f"{comp.margin:.2f}x means it reached {comp.margin * 100:.0f}% of what was required."
+            )
+            self.missing_list.addItem(item)
         for comp in result.unchecked:
-            self.missing_list.addItem(f"UNCHECKED  {comp.unit}:{comp.designator}  ({comp.status})")
+            item = QListWidgetItem(f"UNCHECKED   {comp.unit}:{comp.designator}   ({comp.status})")
+            item.setData(Qt.UserRole, None)
+            self.missing_list.addItem(item)
 
-        self.units_label.setText(
-            "Units: " + ", ".join(f"{u.label}={'PASS' if u.passed else 'FAIL'}" for u in result.units)
-            + f"<br>{result.message}"
+        units = ", ".join(f"{u.label}={'PASS' if u.passed else 'FAIL'}" for u in result.units)
+        self.units_label.setText(f"{result.message}<br>Units: {units}")
+
+    def _on_finding_selected(self, current, _previous):
+        comp = current.data(Qt.UserRole) if current else None
+        self.accept_btn.setEnabled(comp is not None)
+
+    # ---------- tuning ----------
+    def _on_sensitivity_changed(self, value):
+        self.thresholds.sensitivity = clamp_sensitivity(_sensitivity_from_slider(value))
+        self._update_sensitivity_label()
+        self._reevaluate_current()
+
+    def _update_sensitivity_label(self):
+        tuned = len(self.part_thresholds)
+        note = f" - {tuned} part(s) individually tuned" if tuned else ""
+        self.sensitivity_label.setText(f"<b>{self.thresholds.sensitivity:.2f}x</b>{note}")
+
+    def _reevaluate_current(self):
+        """Re-decide the capture on screen. Nothing is re-measured, so
+        the operator sees the effect on the very board that prompted the
+        change."""
+        if not self.last_result:
+            return
+        result = reevaluate(self.last_result, self.thresholds, self.part_thresholds)
+        self._show_result(result)
+
+    def accept_false_call(self):
+        """The operator says a component called missing is really there:
+        lower that part number's threshold to just under what it actually
+        measured, and re-decide immediately."""
+        item = self.missing_list.currentItem()
+        comp = item.data(Qt.UserRole) if item else None
+        if comp is None:
+            return
+        if not comp.part:
+            QMessageBox.information(
+                self, "No part number",
+                f"{comp.designator} has no part number, so there is nothing to tune "
+                "against. Remove it in Program Manager if it should not be inspected."
+            )
+            return
+
+        self.part_thresholds[comp.part] = thresholds_for_false_call(
+            comp.std, comp.intensity_range, sensitivity=self.thresholds.sensitivity)
+        self._update_sensitivity_label()
+        self._reevaluate_current()
+
+    def reset_tuning(self):
+        if self.part_thresholds and QMessageBox.question(
+            self, "Reset tuning",
+            f"Discard the sensitivity setting and {len(self.part_thresholds)} "
+            f"per-part threshold(s)?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self.part_thresholds = {}
+        self.thresholds = PresenceThresholds()
+        self.sensitivity_slider.blockSignals(True)
+        self.sensitivity_slider.setValue(_slider_from_sensitivity(1.0))
+        self.sensitivity_slider.blockSignals(False)
+        self._update_sensitivity_label()
+        self._reevaluate_current()
+
+    def save_tuning(self):
+        try:
+            save_part_thresholds(self.part_thresholds_path, self.part_thresholds)
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not save", str(exc))
+            return
+        QMessageBox.information(
+            self, "Tuning saved",
+            f"Sensitivity {self.thresholds.sensitivity:.2f}x and "
+            f"{len(self.part_thresholds)} per-part threshold(s) saved to\n"
+            f"{self.part_thresholds_path}"
         )
 
+    # ---------- helpers ----------
     def _require(self, condition, message) -> bool:
         if condition:
             return True
@@ -397,21 +624,23 @@ class LiveTab(QWidget):
 
 
 if __name__ == "__main__":
-    import json
     import tempfile
+    from core.fiducials import FiducialRef, set_fiducial_refs
     from core.testutils import (
         make_synthetic_board_frame, place_homography, autosize_canvas, draw_components,
     )
+    from ui.theme import apply_theme
 
-    app = QApplication(sys.argv)
+    app = apply_theme(QApplication(sys.argv))
     win = QMainWindow()
     win.setWindowTitle("Live Inspection - Standalone Test")
-    tab = LiveTab(log_path=str(Path(tempfile.mkdtemp()) / "results.csv"))
+    tmp = Path(tempfile.mkdtemp())
+    tab = LiveTab(log_path=str(tmp / "results.csv"), programs_dir=str(tmp),
+                  part_thresholds_path=str(tmp / "part_thresholds.json"))
     win.setCentralWidget(tab)
-    win.resize(1200, 760)
+    win.resize(1400, 860)
     win.show()
 
-    # Synthesize a board so the tab is usable with no camera attached.
     part_sizes = {"PN-1001": {"width_mm": 2.0, "height_mm": 1.2},
                   "PN-2002": {"width_mm": 3.0, "height_mm": 2.0}}
     comps = [{"designator": f"R{i + 1}", "x": 12.0 + (i % 4) * 18.0, "y": 12.0 + (i // 4) * 18.0,
@@ -420,12 +649,15 @@ if __name__ == "__main__":
     fiducials = [{"x": 4.0, "y": 4.0}, {"x": 74.0, "y": 7.0}, {"x": 8.0, "y": 40.0}]
     program = {"name": "DEMO_BOARD", "is_panel": False, "components": comps,
                "fiducials": fiducials, "panel_offsets": []}
+    set_fiducial_refs(program, [FiducialRef(f"F{i + 1}", f["x"], f["y"])
+                                 for i, f in enumerate(fiducials)])
 
     fid_mm = [(f["x"], f["y"]) for f in fiducials]
     anchor = fid_mm + [(c["x"], c["y"]) for c in comps]
-    H = place_homography(anchor, scale=10.0, angle_deg=2.0)
-    frame, _ = make_synthetic_board_frame(fid_mm, H, image_size=autosize_canvas(anchor, H), noise_std=3.0)
-    draw_components(frame, comps, H, part_sizes, missing_designators=["R3"])  # R3 left bare
+    H = place_homography(anchor, scale=12.0, angle_deg=2.0)
+    frame, _ = make_synthetic_board_frame(fid_mm, H, image_size=autosize_canvas(anchor, H),
+                                           noise_std=3.0)
+    draw_components(frame, comps, H, part_sizes, missing_designators=["R3"], contrast=0.3)
 
     tab.set_program(program, part_sizes)
     tab.set_source(StillImageSource(image=frame))

@@ -18,6 +18,7 @@ TESTS = [
     "test_program_tab_reference_smoke.py",
     "test_calibration_widget_smoke.py",
     "test_live_tab_smoke.py",
+    "test_ui_features_smoke.py",
     "test_main_integration.py",
 ]
 

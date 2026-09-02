@@ -51,6 +51,21 @@ class CalibrationResult:
     rms_error_px: float = float("inf")
     ambiguous: bool = False
     message: str = ""
+    # Worst per-fiducial template match, when alignment came from taught
+    # templates. 0.0 when that path was not used.
+    match_score: float = 0.0
+
+    @property
+    def rms_is_meaningful(self) -> bool:
+        """False when the fit is exactly determined by its points.
+
+        A 2- or 3-point fit passes through every point by construction,
+        so its RMS is always 0.00 and says nothing about how well the
+        board was found -- reporting it as accuracy would be false
+        confidence. With 3 fiducials, the match score is the honest
+        quality signal.
+        """
+        return self.inlier_count > 3
 
 
 # ---------------------------------------------------------------------

@@ -97,10 +97,19 @@ class CalibrationWidget(QWidget):
         super().__init__()
         self.frame_bgr: Optional[np.ndarray] = None
         self.fiducials_mm: List[Point] = []
+        self.labels: List[str] = []
         self.result: Optional[CalibrationResult] = None
         self._manual_clicks: List[Point] = []
         self._manual_active = False
         self._build_ui()
+
+    def _label_for(self, index: int) -> str:
+        """Name of the point being clicked. Named fiducials (F1/F2/F3)
+        are used when the program defines them, so the prompt matches
+        what the operator set up rather than an anonymous number."""
+        if index < len(self.labels):
+            return self.labels[index]
+        return f"fiducial {index + 1}"
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -127,9 +136,11 @@ class CalibrationWidget(QWidget):
         root.addLayout(btn_row)
 
     # ---------- public API ----------
-    def load_frame(self, frame_bgr: np.ndarray, fiducials_mm: List[Point]):
+    def load_frame(self, frame_bgr: np.ndarray, fiducials_mm: List[Point],
+                   labels: Optional[List[str]] = None):
         self.frame_bgr = frame_bgr
         self.fiducials_mm = list(fiducials_mm)
+        self.labels = list(labels or [])
         self.result = None
         self._manual_clicks = []
         self._manual_active = False
@@ -176,8 +187,9 @@ class CalibrationWidget(QWidget):
         if idx < len(self.fiducials_mm):
             mm = self.fiducials_mm[idx]
             self.status_label.setText(
-                f"Manual calibration: click fiducial {idx + 1} of {len(self.fiducials_mm)} "
-                f"(board position {mm[0]:.2f}, {mm[1]:.2f} mm)."
+                f"Click <b>{self._label_for(idx)}</b> "
+                f"({idx + 1} of {len(self.fiducials_mm)}) "
+                f"&mdash; board position {mm[0]:.2f}, {mm[1]:.2f} mm."
             )
         else:
             self.status_label.setText("All fiducials clicked -- computing homography...")
@@ -207,7 +219,7 @@ class CalibrationWidget(QWidget):
         overlay = self.frame_bgr.copy()
         for i, (x, y) in enumerate(self._manual_clicks):
             cv2.drawMarker(overlay, (int(x), int(y)), (0, 200, 255), cv2.MARKER_CROSS, 20, 2)
-            cv2.putText(overlay, str(i + 1), (int(x) + 8, int(y) - 8),
+            cv2.putText(overlay, self._label_for(i), (int(x) + 8, int(y) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
         if self.result is not None:
             color = (0, 220, 0) if self.result.success else (0, 0, 255)
@@ -229,15 +241,15 @@ class CalibrationDialog(QDialog):
     """Modal wrapper around CalibrationWidget, for calibrating from the
     Live Inspection tab. Accepts once a calibration succeeds."""
 
-    def __init__(self, frame_bgr, fiducials_mm, parent=None):
+    def __init__(self, frame_bgr, fiducials_mm, parent=None, labels=None):
         super().__init__(parent)
-        self.setWindowTitle("Calibrate Board")
+        self.setWindowTitle("Align Board")
         self.resize(900, 720)
         self.result_calibration: Optional[CalibrationResult] = None
 
         layout = QVBoxLayout(self)
         self.widget = CalibrationWidget()
-        self.widget.load_frame(frame_bgr, fiducials_mm)
+        self.widget.load_frame(frame_bgr, fiducials_mm, labels=labels)
         self.widget.calibrated.connect(self._on_calibrated)
         layout.addWidget(self.widget)
 

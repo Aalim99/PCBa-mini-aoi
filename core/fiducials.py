@@ -332,12 +332,14 @@ def align_with_templates(frame: np.ndarray, refs: List[FiducialRef],
                                   message="Homography fit failed on the located fiducials.")
 
     worst = min(chosen[r.id][2] for r in usable)
+    quality = (f"RMS {rms:.2f}px" if len(usable) > 3
+               else f"exact {len(usable)}-point fit")
     return CalibrationResult(
         success=True, method="template", homography=H,
         matched_mm=matched_mm, matched_px=matched_px,
-        inlier_count=len(usable), rms_error_px=rms,
+        inlier_count=len(usable), rms_error_px=rms, match_score=worst,
         message=(f"Aligned on {len(usable)} taught fiducials "
-                  f"({', '.join(r.id for r in usable)}), match {worst:.2f}, RMS {rms:.2f}px."),
+                  f"({', '.join(r.id for r in usable)}), worst match {worst:.2f}, {quality}."),
     )
 
 

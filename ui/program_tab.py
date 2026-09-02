@@ -19,15 +19,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QAbstractItemView, QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QListWidgetItem, QGraphicsView, QGraphicsScene,
-    QLabel, QPushButton, QDoubleSpinBox, QFormLayout, QFileDialog,
+    QLabel, QLineEdit, QPushButton, QDoubleSpinBox, QFormLayout, QFileDialog,
     QMessageBox, QGroupBox, QInputDialog, QGraphicsPixmapItem
 )
 from PyQt5.QtCore import Qt, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QPen, QBrush, QPainter, QImage, QPixmap
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.program_edit import (
+    delete_designators, delete_part, describe_removal, part_summary, save_program_json,
+)
+from ui.fiducial_panel import FiducialPanel
+from ui.theme import COLORS, Card, muted_label
 
 
 PX_PER_MM = 40
@@ -157,6 +162,8 @@ class ProgramTab(QWidget):
         self.reference_homography = None
         self.instances = []
         self.instance_index = 0
+        self._backdrop_item = None
+        self._is_active = False
 
         self._build_ui()
 
@@ -187,102 +194,167 @@ class ProgramTab(QWidget):
     # ---------- UI layout ----------
     def _build_ui(self):
         root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+        root.addLayout(self._build_program_column(), stretch=3)
+        root.addLayout(self._build_board_column(), stretch=3)
+        root.addLayout(self._build_editor_column(), stretch=4)
 
-        # Left column: load program + part list
-        left = QVBoxLayout()
-        self.import_btn = QPushButton("Import XY File...")
+    def _build_program_column(self):
+        column = QVBoxLayout()
+        column.setSpacing(12)
+
+        program_card = Card("Program")
+        buttons = QHBoxLayout()
+        self.import_btn = QPushButton("Import XY...")
+        self.import_btn.setProperty("variant", "primary")
         self.import_btn.clicked.connect(self.import_xy_dialog)
-        left.addWidget(self.import_btn)
-
-        self.load_btn = QPushButton("Load Program JSON")
+        buttons.addWidget(self.import_btn)
+        self.load_btn = QPushButton("Open...")
+        self.load_btn.setProperty("variant", "ghost")
         self.load_btn.clicked.connect(self.load_program_dialog)
-        left.addWidget(self.load_btn)
+        buttons.addWidget(self.load_btn)
+        program_card.body.addLayout(buttons)
 
-        self.program_label = QLabel("No program loaded")
-        self.program_label.setWordWrap(True)
-        left.addWidget(self.program_label)
+        self.program_label = muted_label("No program loaded")
+        program_card.body.addWidget(self.program_label)
 
         self.activate_btn = QPushButton("Set Active for Inspection")
+        self.activate_btn.setMinimumHeight(36)
         self.activate_btn.setEnabled(False)
         self.activate_btn.clicked.connect(self.activate_program)
-        left.addWidget(self.activate_btn)
+        program_card.body.addWidget(self.activate_btn)
+        column.addWidget(program_card)
 
+        parts_card = Card("Part numbers")
         self.part_list = QListWidget()
         self.part_list.currentItemChanged.connect(self.on_part_selected)
-        left.addWidget(self.part_list, stretch=1)
+        parts_card.body.addWidget(self.part_list, stretch=1)
+        self.delete_part_btn = QPushButton("Delete Part Number")
+        self.delete_part_btn.setProperty("variant", "danger")
+        self.delete_part_btn.setEnabled(False)
+        self.delete_part_btn.setToolTip(
+            "Remove every component of this part number from the program,\n"
+            "so it is no longer inspected."
+        )
+        self.delete_part_btn.clicked.connect(self.delete_selected_part)
+        parts_card.body.addWidget(self.delete_part_btn)
+        column.addWidget(parts_card, stretch=1)
 
-        root.addLayout(left, stretch=2)
+        comp_card = Card("Components")
+        search_row = QHBoxLayout()
+        self.component_search = QLineEdit()
+        self.component_search.setPlaceholderText("Filter by designator...")
+        self.component_search.textChanged.connect(self._populate_component_list)
+        search_row.addWidget(self.component_search)
+        comp_card.body.addLayout(search_row)
 
-        # Middle column: read-only board overview, selected part highlighted
-        mid = QVBoxLayout()
-        mid.addWidget(QLabel("Board overview (orange = selected part)"))
+        self.component_list = QListWidget()
+        self.component_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.component_list.itemSelectionChanged.connect(self._on_component_selection)
+        comp_card.body.addWidget(self.component_list, stretch=1)
+
+        self.delete_component_btn = QPushButton("Delete Selected Designator(s)")
+        self.delete_component_btn.setProperty("variant", "danger")
+        self.delete_component_btn.setEnabled(False)
+        self.delete_component_btn.setToolTip(
+            "Remove these designators from the program. Use for test points,\n"
+            "mechanical parts, or anything that should not be judged."
+        )
+        self.delete_component_btn.clicked.connect(self.delete_selected_components)
+        comp_card.body.addWidget(self.delete_component_btn)
+        column.addWidget(comp_card, stretch=1)
+        return column
+
+    def _build_board_column(self):
+        column = QVBoxLayout()
+        column.setSpacing(12)
+
+        overview_card = Card("Board overview")
+        self.overview_hint = muted_label("Selected part highlighted in orange")
+        overview_card.body.addWidget(self.overview_hint)
         self.overview_scene = QGraphicsScene()
         self.overview_view = QGraphicsView(self.overview_scene)
         self.overview_view.setRenderHint(QPainter.Antialiasing)
-        self.overview_view.setMinimumWidth(280)
-        mid.addWidget(self.overview_view, stretch=1)
-        root.addLayout(mid, stretch=2)
+        self.overview_view.setMinimumWidth(260)
+        overview_card.body.addWidget(self.overview_view, stretch=1)
+        column.addWidget(overview_card, stretch=1)
 
-        # Right column: zoomed drag-to-resize canvas + precise mm entry
-        right = QVBoxLayout()
-        right.addWidget(QLabel("Drag a corner to resize this part's ROI box"))
+        self.fiducial_panel = FiducialPanel(programs_dir=self.programs_dir)
+        self.fiducial_panel.changed.connect(self._on_fiducials_changed)
+        column.addWidget(self.fiducial_panel)
+        return column
 
+    def _build_editor_column(self):
+        column = QVBoxLayout()
+        column.setSpacing(12)
+
+        ref_card = Card("Reference image")
         ref_row = QHBoxLayout()
-        self.ref_btn = QPushButton("Load Reference Image...")
+        self.ref_btn = QPushButton("Load Reference...")
         self.ref_btn.clicked.connect(self.load_reference_image)
         ref_row.addWidget(self.ref_btn)
         self.clear_ref_btn = QPushButton("Clear")
+        self.clear_ref_btn.setProperty("variant", "ghost")
         self.clear_ref_btn.setEnabled(False)
         self.clear_ref_btn.clicked.connect(self.clear_reference_image)
         ref_row.addWidget(self.clear_ref_btn)
-        right.addLayout(ref_row)
+        ref_card.body.addLayout(ref_row)
+        self.ref_label = muted_label("No reference image - sizes are set blind")
+        ref_card.body.addWidget(self.ref_label)
+        column.addWidget(ref_card)
 
-        self.ref_label = QLabel("No reference image - sizes are set blind")
-        self.ref_label.setWordWrap(True)
-        right.addWidget(self.ref_label)
+        roi_card = Card("ROI size")
+        self.roi_hint = muted_label("Drag a corner, or type exact millimetres")
+        roi_card.body.addWidget(self.roi_hint)
 
         self.detail_scene = QGraphicsScene()
         self.detail_view = QGraphicsView(self.detail_scene)
         self.detail_view.setRenderHint(QPainter.Antialiasing)
-        self.detail_view.setMinimumSize(320, 320)
-        right.addWidget(self.detail_view, stretch=1)
+        self.detail_view.setMinimumSize(320, 300)
+        roi_card.body.addWidget(self.detail_view, stretch=1)
 
         nav = QHBoxLayout()
-        self.prev_btn = QPushButton("< Prev")
+        self.prev_btn = QPushButton("‹ Prev")
+        self.prev_btn.setProperty("variant", "ghost")
         self.prev_btn.clicked.connect(lambda: self.step_instance(-1))
         nav.addWidget(self.prev_btn)
         self.instance_label = QLabel("-")
         self.instance_label.setAlignment(Qt.AlignCenter)
+        self.instance_label.setProperty("variant", "muted")
         nav.addWidget(self.instance_label, stretch=1)
-        self.next_btn = QPushButton("Next >")
+        self.next_btn = QPushButton("Next ›")
+        self.next_btn.setProperty("variant", "ghost")
         self.next_btn.clicked.connect(lambda: self.step_instance(1))
         nav.addWidget(self.next_btn)
-        right.addLayout(nav)
+        roi_card.body.addLayout(nav)
 
-        form_box = QGroupBox("Size (mm)")
         form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
         self.width_spin = QDoubleSpinBox()
         self.width_spin.setRange(0.1, 50.0)
         self.width_spin.setSingleStep(0.1)
         self.width_spin.setDecimals(2)
+        self.width_spin.setSuffix(" mm")
         self.width_spin.valueChanged.connect(self.on_spin_changed)
 
         self.height_spin = QDoubleSpinBox()
         self.height_spin.setRange(0.1, 50.0)
         self.height_spin.setSingleStep(0.1)
         self.height_spin.setDecimals(2)
+        self.height_spin.setSuffix(" mm")
         self.height_spin.valueChanged.connect(self.on_spin_changed)
 
-        form.addRow("Width:", self.width_spin)
-        form.addRow("Height:", self.height_spin)
-        form_box.setLayout(form)
-        right.addWidget(form_box)
+        form.addRow("Width", self.width_spin)
+        form.addRow("Height", self.height_spin)
+        roi_card.body.addLayout(form)
 
         self.save_btn = QPushButton("Save Part Sizes")
+        self.save_btn.setProperty("variant", "primary")
         self.save_btn.clicked.connect(self.save_all)
-        right.addWidget(self.save_btn)
-
-        root.addLayout(right, stretch=3)
+        roi_card.body.addWidget(self.save_btn)
+        column.addWidget(roi_card, stretch=1)
+        return column
 
     # ---------- program loading ----------
     def import_xy_dialog(self):
@@ -328,13 +400,15 @@ class ProgramTab(QWidget):
         with open(path) as f:
             self.program = json.load(f)
         self.program_path = path
-        self.program_label.setText(
-            f"{self.program['name']}  |  {len(self.program['components'])} components"
-        )
+        self._is_active = False
         self.activate_btn.setEnabled(True)
         self._load_saved_reference()
         self._populate_part_list()
+        self._populate_component_list()
         self._draw_overview()
+        self.fiducial_panel.set_program(self.program)
+        self.fiducial_panel.set_reference(self.reference_image, self.reference_homography)
+        self._update_program_label()
 
     def activate_program(self):
         """Hand this program to the Live Inspection tab. Sizes are saved
@@ -343,11 +417,10 @@ class ProgramTab(QWidget):
         if not self.program:
             return
         self._save_part_sizes()
+        self._on_fiducials_changed()   # persist fiducial definitions too
+        self._is_active = True
         self.program_activated.emit(self.program, self.part_sizes)
-        self.program_label.setText(
-            f"{self.program['name']}  |  {len(self.program['components'])} components"
-            f"  |  <b>ACTIVE</b>"
-        )
+        self._update_program_label()
 
     def _populate_part_list(self):
         self.part_list.clear()
@@ -364,9 +437,110 @@ class ProgramTab(QWidget):
             item = QListWidgetItem(f"{part}  ({len(comps)}x)  [{size_str}]")
             item.setData(Qt.UserRole, part)
             item.setData(Qt.UserRole + 1, len(comps))
-            if not size:
-                item.setForeground(QColor("red"))
+            # Unsized parts cannot be inspected, so flag them rather than
+            # letting them look like any other row.
+            item.setForeground(QColor(COLORS["text"] if size else COLORS["warn"]))
             self.part_list.addItem(item)
+
+    # ---------- component list and deletion ----------
+    def _populate_component_list(self):
+        """Every placement row, filtered by the search box. Listed from
+        the program itself rather than panel-expanded, since deleting is
+        an edit to the program, not to one unit's copy of it."""
+        self.component_list.clear()
+        if not self.program:
+            return
+        needle = self.component_search.text().strip().lower()
+        for c in self.program.get("components") or []:
+            designator = str(c.get("designator", "?"))
+            part = c.get("part") or "-"
+            if needle and needle not in designator.lower() and needle not in str(part).lower():
+                continue
+            item = QListWidgetItem(f"{designator}      {part}")
+            item.setData(Qt.UserRole, designator)
+            self.component_list.addItem(item)
+
+    def _on_component_selection(self):
+        self.delete_component_btn.setEnabled(bool(self.component_list.selectedItems()))
+
+    def delete_selected_components(self):
+        """Remove designators from the program. Confirmed, because it
+        edits the program on disk rather than just the view."""
+        items = self.component_list.selectedItems()
+        if not items or not self.program:
+            return
+        designators = [i.data(Qt.UserRole) for i in items]
+        _count, summary = describe_removal([{"designator": d} for d in designators])
+        if QMessageBox.question(
+            self, "Delete components",
+            f"Remove {len(designators)} designator(s) from {self.program['name']}?\n\n{summary}\n\n"
+            "They will no longer be inspected. Re-import the XY file to get them back.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        removed = delete_designators(self.program, designators)
+        self._after_program_edit(f"Removed {len(removed)} component(s): {summary}")
+
+    def delete_selected_part(self):
+        item = self.part_list.currentItem()
+        if not item or not self.program:
+            return
+        part = item.data(Qt.UserRole)
+        count = part_summary(self.program).get(part, 0)
+        if QMessageBox.question(
+            self, "Delete part number",
+            f"Remove all {count} component(s) of {part} from {self.program['name']}?\n\n"
+            "They will no longer be inspected. Re-import the XY file to get them back.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        removed = delete_part(self.program, part)
+        self._after_program_edit(f"Removed part {part} ({len(removed)} components)")
+
+    def _after_program_edit(self, note):
+        """Persist an edit and rebuild everything that reads the program."""
+        if self.program_path:
+            try:
+                save_program_json(self.program, self.program_path)
+            except OSError as exc:
+                QMessageBox.warning(self, "Could not save", f"Program not written:\n{exc}")
+        self.current_part = None
+        self.instances = []
+        self.detail_scene.clear()
+        self._backdrop_item = None
+        self.current_rect_item = None
+        self._populate_part_list()
+        self._populate_component_list()
+        self._draw_overview()
+        self._update_instance_label()
+        self._update_program_label(note)
+
+    def _update_program_label(self, note=None):
+        if not self.program:
+            self.program_label.setText("No program loaded")
+            return
+        parts = len(part_summary(self.program))
+        text = (f"<b>{self.program['name']}</b><br>"
+                f"{len(self.program.get('components') or [])} components, {parts} part numbers")
+        if self._is_active:
+            text += f"<br><span style='color:{COLORS['pass']}'><b>ACTIVE</b></span>"
+        if note:
+            text += f"<br><span style='color:{COLORS['faint']}'>{note}</span>"
+        self.program_label.setText(text)
+
+    def _on_fiducials_changed(self):
+        """Fiducial definitions live in the program, so persist them --
+        and redraw the overview, where the alignment triangle is shown."""
+        self._draw_overview()
+        if self.current_part:
+            self._highlight_part_in_overview(self.current_part)
+        if self.program and self.program_path:
+            try:
+                save_program_json(self.program, self.program_path)
+            except OSError as exc:
+                QMessageBox.warning(self, "Could not save", f"Program not written:\n{exc}")
 
     # ---------- reference image ----------
     def load_reference_image(self):
@@ -423,6 +597,7 @@ class ProgramTab(QWidget):
         self.reference_homography = homography
         self.clear_ref_btn.setEnabled(True)
         self.ref_label.setText(message or "<b>Reference aligned</b> - box is shown over the real part")
+        self.fiducial_panel.set_reference(self.reference_image, self.reference_homography)
         if self.current_part:
             self._draw_detail(self.current_part)
 
@@ -456,6 +631,7 @@ class ProgramTab(QWidget):
         self.reference_homography = None
         self.clear_ref_btn.setEnabled(False)
         self.ref_label.setText("No reference image - sizes are set blind")
+        self.fiducial_panel.set_reference(None, None)
         if self.current_part:
             self._draw_detail(self.current_part)
 
@@ -512,22 +688,75 @@ class ProgramTab(QWidget):
         comps = self.program["components"]
         if not comps:
             return
-        xs = [c["x"] for c in comps]
-        ys = [c["y"] for c in comps]
+        # Scale to everything drawn, fiducials included: they routinely
+        # sit outside the component footprint (board corners), and
+        # scaling to components alone pushes them off the canvas.
+        from core.fiducials import get_fiducial_refs
+
+        points = [(c["x"], c["y"]) for c in comps]
+        points += [(float(f["x"]), float(f["y"])) for f in (self.program.get("fiducials") or [])]
+        points += [(r.x_mm, r.y_mm) for r in get_fiducial_refs(self.program)]
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
         minx, maxx = min(xs), max(xs)
         miny, maxy = min(ys), max(ys)
         span = max(maxx - minx, maxy - miny, 1)
         scale = 260.0 / span
 
+        def to_scene(x_mm, y_mm):
+            return ((x_mm - minx) * scale,
+                    (maxy - y_mm) * scale)   # flip Y: board Y-up -> screen Y-down
+
         for c in comps:
-            px = (c["x"] - minx) * scale
-            py = (maxy - c["y"]) * scale  # flip Y: board Y-up -> screen Y-down
+            px, py = to_scene(c["x"], c["y"])
             dot = self.overview_scene.addEllipse(
                 px - 1, py - 1, 2, 2, QPen(Qt.gray), QBrush(Qt.gray)
             )
             dot.setData(0, c.get("part"))
 
+        self._draw_fiducials_on_overview(to_scene)
         self._fit_overview()
+
+    def _draw_fiducials_on_overview(self, to_scene):
+        """Show where the board is aligned from: every Pattern Fiducial
+        as a faint ring, and the chosen F1/F2/F3 as labelled marks joined
+        into their alignment triangle. Seeing the triangle is the point --
+        a long thin one pins rotation poorly, and that is invisible in a
+        list of coordinates."""
+        from core.fiducials import get_fiducial_refs
+
+        faint = QPen(QColor(COLORS["faint"]))
+        for f in self.program.get("fiducials") or []:
+            px, py = to_scene(float(f["x"]), float(f["y"]))
+            ring = self.overview_scene.addEllipse(px - 3, py - 3, 6, 6, faint, QBrush(Qt.NoBrush))
+            ring.setData(0, "__fiducial__")
+
+        refs = get_fiducial_refs(self.program)
+        if not refs:
+            return
+
+        accent = QColor(COLORS["accent"])
+        points = [to_scene(r.x_mm, r.y_mm) for r in refs]
+        if len(points) >= 3:
+            edge = QPen(accent, 0.7, Qt.DashLine)
+            for i in range(len(points)):
+                a, b = points[i], points[(i + 1) % len(points)]
+                line = self.overview_scene.addLine(a[0], a[1], b[0], b[1], edge)
+                line.setData(0, "__fiducial__")
+
+        for ref, (px, py) in zip(refs, points):
+            mark = self.overview_scene.addEllipse(px - 4, py - 4, 8, 8,
+                                                  QPen(accent, 1.2), QBrush(accent))
+            mark.setData(0, "__fiducial__")
+            text = self.overview_scene.addSimpleText(ref.id)
+            text.setBrush(QBrush(accent))
+            font = text.font()
+            font.setPointSizeF(7.0)
+            font.setBold(True)
+            text.setFont(font)
+            text.setPos(px + 5, py - 10)
+            text.setData(0, "__fiducial__")
 
     def _fit_overview(self):
         # Fit to the logical board canvas (positions are scaled into a fixed
@@ -542,15 +771,22 @@ class ProgramTab(QWidget):
         )
 
     def _highlight_part_in_overview(self, part):
+        highlight = QColor(255, 140, 0)
         for item in self.overview_scene.items():
-            if item.data(0) == part:
-                item.setBrush(QBrush(QColor(255, 140, 0)))
-                item.setPen(QPen(QColor(255, 140, 0)))
+            tag = item.data(0)
+            # Fiducial marks, their triangle and labels are not component
+            # dots: they have no rect to resize and must keep their colour.
+            if tag == "__fiducial__" or not hasattr(item, "rect"):
+                continue
+            if tag == part:
+                item.setBrush(QBrush(highlight))
+                item.setPen(QPen(highlight))
                 item.setRect(item.rect().adjusted(-1, -1, 1, 1))
             else:
                 item.setBrush(QBrush(Qt.gray))
                 item.setPen(QPen(Qt.gray))
-                item.setRect(QRectF(item.rect().center().x() - 1, item.rect().center().y() - 1, 2, 2))
+                item.setRect(QRectF(item.rect().center().x() - 1,
+                                    item.rect().center().y() - 1, 2, 2))
 
     # ---------- detail / resize canvas ----------
     def on_part_selected(self, current, previous):
@@ -558,6 +794,7 @@ class ProgramTab(QWidget):
             return
         part = current.data(Qt.UserRole)
         self.current_part = part
+        self.delete_part_btn.setEnabled(part is not None)
         self._load_instances(part)
         self._highlight_part_in_overview(part)
         self._draw_detail(part)
@@ -663,7 +900,7 @@ class ProgramTab(QWidget):
         size = self.part_sizes.get(part)
         size_str = f"{size['width_mm']:.2f}x{size['height_mm']:.2f}mm"
         item.setText(f"{part}  ({count}x)  [{size_str}]")
-        item.setForeground(QColor("black"))
+        item.setForeground(QColor(COLORS["text"]))
 
     # ---------- save ----------
     def save_all(self):
