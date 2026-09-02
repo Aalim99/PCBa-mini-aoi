@@ -54,6 +54,44 @@ def make_synthetic_board_frame(
     return frame, px
 
 
+def draw_components(frame, components, homography, part_sizes, missing_designators=()):
+    """Draw component bodies onto a synthetic board frame at the pixel
+    positions implied by `homography`, skipping any designator listed in
+    `missing_designators` so its pad is left bare. Populated parts get a
+    dark textured body (varied interior + light terminations); bare pads
+    get a flat low-contrast patch, which is what the presence heuristic
+    is meant to tell apart.
+
+    Mutates and returns `frame`.
+    """
+    from core.inspection import project_roi
+
+    missing = set(missing_designators)
+    for c in components:
+        size = part_sizes.get(c.get("part"))
+        if not size:
+            continue
+        x, y, w, h = project_roi(homography, c["x"], c["y"],
+                                 size["width_mm"], size["height_mm"],
+                                 c.get("rotation", 0.0) or 0.0)
+        x0, y0, x1, y1 = int(round(x)), int(round(y)), int(round(x + w)), int(round(y + h))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+
+        if c["designator"] in missing:
+            # bare pad: flat, close to the surrounding solder mask
+            cv2.rectangle(frame, (x0, y0), (x1, y1), (70, 140, 70), -1)
+            continue
+
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (35, 35, 40), -1)          # dark body
+        cv2.rectangle(frame, (x0, y0), (x0 + max(1, (x1 - x0) // 5), y1),
+                      (200, 200, 205), -1)                                   # terminations
+        cv2.rectangle(frame, (x1 - max(1, (x1 - x0) // 5), y0), (x1, y1),
+                      (200, 200, 205), -1)
+        cv2.line(frame, (x0, (y0 + y1) // 2), (x1, (y0 + y1) // 2), (120, 120, 125), 1)
+    return frame
+
+
 def autosize_canvas(fiducials_mm, homography, margin_px=100):
     """Pick a canvas size that comfortably contains every projected
     fiducial position, so tests don't silently clip fiducials off the
