@@ -19,6 +19,15 @@ python main.py
    typing exact mm; sizes live in a shared `programs/part_sizes.json`
    that carries across boards, since the same part number reappears.
    Press *Set Active for Inspection*.
+
+   *Load Reference Image…* takes a photo of a known-good board and aligns
+   it to the program's fiducials, then draws the real component behind
+   the ROI box at true millimetre scale — so a box is sized against the
+   actual part instead of guessed. The part is shown de-rotated, so one
+   ROI size fits every placement of it, and *Prev/Next* steps through the
+   part's other instances (every panel unit included) to check the box
+   holds up across the board. The reference is stored with the program
+   and reloads with it.
 2. **Live Inspection** — start the camera (or load a still image), press
    *Calibrate* to align the board, then *INSPECT* (or Space) for each
    board. The view holds the annotated result until *Resume Live*.
@@ -33,6 +42,7 @@ python main.py
 | `core/calibration.py` | Fiducial detection, correspondence matching, mm→px homography |
 | `core/inspection.py` | ROI projection, presence check, panel handling, verdicts |
 | `core/barcode_reader.py` | Traceability code from the inspection frame |
+| `core/reference_image.py` | Fiducial-aligned reference board photo, mm-accurate component patches |
 | `core/result_log.py` | Append/read the results CSV |
 | `core/camera.py` | Camera, with a still-image stand-in |
 | `core/testutils.py` | Synthetic board frames (dev/test only) |

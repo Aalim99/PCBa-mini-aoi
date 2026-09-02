@@ -64,31 +64,38 @@ def draw_components(frame, components, homography, part_sizes, missing_designato
 
     Mutates and returns `frame`.
     """
-    from core.inspection import project_roi
+    from core.inspection import project_local_points
+
+    def fill(local_quad, colour, comp):
+        pts = project_local_points(homography, comp["x"], comp["y"],
+                                   comp.get("rotation", 0.0) or 0.0,
+                                   np.asarray(local_quad, dtype=np.float64))
+        # LINE_8, not LINE_AA: crisp edges keep measured extents exact in
+        # tests, where an antialiased ramp reads as extra component width.
+        cv2.fillConvexPoly(frame, np.round(pts).astype(np.int32), colour, lineType=cv2.LINE_8)
 
     missing = set(missing_designators)
     for c in components:
         size = part_sizes.get(c.get("part"))
         if not size:
             continue
-        x, y, w, h = project_roi(homography, c["x"], c["y"],
-                                 size["width_mm"], size["height_mm"],
-                                 c.get("rotation", 0.0) or 0.0)
-        x0, y0, x1, y1 = int(round(x)), int(round(y)), int(round(x + w)), int(round(y + h))
-        if x1 - x0 < 2 or y1 - y0 < 2:
-            continue
+        w_mm, h_mm = float(size["width_mm"]), float(size["height_mm"])
+        hw, hh = w_mm / 2.0, h_mm / 2.0
+        # Project the true rotated footprint rather than filling its
+        # axis-aligned bounding box: a tilted camera would otherwise draw
+        # every part fatter than it really is.
+        body = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
 
         if c["designator"] in missing:
-            # bare pad: flat, close to the surrounding solder mask
-            cv2.rectangle(frame, (x0, y0), (x1, y1), (70, 140, 70), -1)
+            fill(body, (70, 140, 70), c)   # bare pad: flat, close to the solder mask
             continue
 
-        cv2.rectangle(frame, (x0, y0), (x1, y1), (35, 35, 40), -1)          # dark body
-        cv2.rectangle(frame, (x0, y0), (x0 + max(1, (x1 - x0) // 5), y1),
-                      (200, 200, 205), -1)                                   # terminations
-        cv2.rectangle(frame, (x1 - max(1, (x1 - x0) // 5), y0), (x1, y1),
-                      (200, 200, 205), -1)
-        cv2.line(frame, (x0, (y0 + y1) // 2), (x1, (y0 + y1) // 2), (120, 120, 125), 1)
+        fill(body, (35, 35, 40), c)                                    # dark body
+        term = max(w_mm / 5.0, 0.05)
+        fill([(-hw, -hh), (-hw + term, -hh), (-hw + term, hh), (-hw, hh)], (200, 200, 205), c)
+        fill([(hw - term, -hh), (hw, -hh), (hw, hh), (hw - term, hh)], (200, 200, 205), c)
+        fill([(-hw, -hh * 0.12), (hw, -hh * 0.12), (hw, hh * 0.12), (-hw, hh * 0.12)],
+             (120, 120, 125), c)                                       # body marking
     return frame
 
 

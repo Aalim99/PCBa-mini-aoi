@@ -202,19 +202,28 @@ def expanded_fiducials_mm(program: dict, mode: Optional[str] = None) -> List[Poi
 # ROI projection and presence check
 # ---------------------------------------------------------------------
 
+def project_local_points(H, x_mm: float, y_mm: float, rotation_deg: float,
+                         local_points: np.ndarray) -> np.ndarray:
+    """Project points given in a component's own frame (millimetres,
+    origin at the component centre) onto the image."""
+    t = math.radians(rotation_deg)
+    rot = np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]], dtype=np.float64)
+    board = np.asarray(local_points, dtype=np.float64) @ rot.T + np.array([x_mm, y_mm], dtype=np.float64)
+    return mm_to_px_batch(H, board)
+
+
+def roi_corners_local(w_mm: float, h_mm: float) -> np.ndarray:
+    hw, hh = w_mm / 2.0, h_mm / 2.0
+    return np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]], dtype=np.float64)
+
+
 def project_roi(H, x_mm: float, y_mm: float, w_mm: float, h_mm: float,
                 rotation_deg: float = 0.0) -> Tuple[float, float, float, float]:
     """Project a component's ROI box onto the image, returning the
     axis-aligned pixel bounding box (x, y, w, h). The box is rotated in
     board space first, so a part placed at 90 degrees gets the right
     footprint rather than its width and height swapped by accident."""
-    hw, hh = w_mm / 2.0, h_mm / 2.0
-    corners = np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]], dtype=np.float64)
-    t = math.radians(rotation_deg)
-    rot = np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]], dtype=np.float64)
-    corners = corners @ rot.T + np.array([x_mm, y_mm], dtype=np.float64)
-
-    px = mm_to_px_batch(H, corners)
+    px = project_local_points(H, x_mm, y_mm, rotation_deg, roi_corners_local(w_mm, h_mm))
     x0, y0 = px.min(axis=0)
     x1, y1 = px.max(axis=0)
     return float(x0), float(y0), float(x1 - x0), float(y1 - y0)

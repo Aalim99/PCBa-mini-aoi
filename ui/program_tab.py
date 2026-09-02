@@ -16,14 +16,16 @@ import sys
 import json
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QListWidgetItem, QGraphicsView, QGraphicsScene,
     QLabel, QPushButton, QDoubleSpinBox, QFormLayout, QFileDialog,
-    QMessageBox, QGroupBox, QInputDialog
+    QMessageBox, QGroupBox, QInputDialog, QGraphicsPixmapItem
 )
 from PyQt5.QtCore import Qt, QRectF, pyqtSignal
-from PyQt5.QtGui import QColor, QPen, QBrush, QPainter
+from PyQt5.QtGui import QColor, QPen, QBrush, QPainter, QImage, QPixmap
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -32,11 +34,22 @@ PX_PER_MM = 40
 DEFAULT_SIZE_MM = 1.0
 
 
-def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0)):
+def bgr_to_qpixmap(bgr):
+    rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    h, w, ch = rgb.shape
+    return QPixmap.fromImage(QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy())
+
+
+def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0), filled=True):
     """Factory returning a QGraphicsRectItem subclass instance with
     corner-drag resizing. Position is NOT draggable — only size
     changes, since the item represents a component's ROI box size,
-    not its board location."""
+    not its board location.
+
+    `filled=False` draws outline only, for when a reference photo sits
+    behind the box: a translucent fill washes out the very component
+    the box is being sized against.
+    """
 
     from PyQt5.QtWidgets import QGraphicsRectItem
 
@@ -46,9 +59,14 @@ def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0)):
         def __init__(self, rect, on_resize, color):
             super().__init__(rect)
             self.on_resize = on_resize
-            self.setPen(QPen(color, 2))
-            self.setBrush(QBrush(color.lighter(160)))
-            self.setOpacity(0.65)
+            if filled:
+                self.setPen(QPen(color, 2))
+                self.setBrush(QBrush(color.lighter(160)))
+                self.setOpacity(0.65)
+            else:
+                self.setPen(QPen(color, 2))
+                self.setBrush(QBrush(Qt.NoBrush))
+                self.setOpacity(1.0)
             self.setAcceptHoverEvents(True)
             self._resize_corner = None
             self._drag_start = None
@@ -133,6 +151,12 @@ class ProgramTab(QWidget):
         self.part_sizes = self._load_part_sizes()
         self.current_part = None
         self.current_rect_item = None
+        # Reference board photo, aligned to the program's fiducials, so
+        # ROI sizes can be set against the real part instead of guessed.
+        self.reference_image = None
+        self.reference_homography = None
+        self.instances = []
+        self.instance_index = 0
 
         self._build_ui()
 
@@ -202,11 +226,38 @@ class ProgramTab(QWidget):
         # Right column: zoomed drag-to-resize canvas + precise mm entry
         right = QVBoxLayout()
         right.addWidget(QLabel("Drag a corner to resize this part's ROI box"))
+
+        ref_row = QHBoxLayout()
+        self.ref_btn = QPushButton("Load Reference Image...")
+        self.ref_btn.clicked.connect(self.load_reference_image)
+        ref_row.addWidget(self.ref_btn)
+        self.clear_ref_btn = QPushButton("Clear")
+        self.clear_ref_btn.setEnabled(False)
+        self.clear_ref_btn.clicked.connect(self.clear_reference_image)
+        ref_row.addWidget(self.clear_ref_btn)
+        right.addLayout(ref_row)
+
+        self.ref_label = QLabel("No reference image - sizes are set blind")
+        self.ref_label.setWordWrap(True)
+        right.addWidget(self.ref_label)
+
         self.detail_scene = QGraphicsScene()
         self.detail_view = QGraphicsView(self.detail_scene)
         self.detail_view.setRenderHint(QPainter.Antialiasing)
         self.detail_view.setMinimumSize(320, 320)
         right.addWidget(self.detail_view, stretch=1)
+
+        nav = QHBoxLayout()
+        self.prev_btn = QPushButton("< Prev")
+        self.prev_btn.clicked.connect(lambda: self.step_instance(-1))
+        nav.addWidget(self.prev_btn)
+        self.instance_label = QLabel("-")
+        self.instance_label.setAlignment(Qt.AlignCenter)
+        nav.addWidget(self.instance_label, stretch=1)
+        self.next_btn = QPushButton("Next >")
+        self.next_btn.clicked.connect(lambda: self.step_instance(1))
+        nav.addWidget(self.next_btn)
+        right.addLayout(nav)
 
         form_box = QGroupBox("Size (mm)")
         form = QFormLayout()
@@ -281,6 +332,7 @@ class ProgramTab(QWidget):
             f"{self.program['name']}  |  {len(self.program['components'])} components"
         )
         self.activate_btn.setEnabled(True)
+        self._load_saved_reference()
         self._populate_part_list()
         self._draw_overview()
 
@@ -315,6 +367,142 @@ class ProgramTab(QWidget):
             if not size:
                 item.setForeground(QColor("red"))
             self.part_list.addItem(item)
+
+    # ---------- reference image ----------
+    def load_reference_image(self):
+        """Pick a photo of a known-good board and align it to this
+        program's fiducials, so the ROI editor can show the real part."""
+        if not self.program:
+            QMessageBox.warning(self, "No program", "Load a program first.")
+            return
+
+        from core.inspection import expanded_fiducials_mm
+        fiducials_mm = expanded_fiducials_mm(self.program)
+        if len(fiducials_mm) < 2:
+            QMessageBox.warning(self, "Not enough fiducials",
+                                 "This program has fewer than 2 fiducials, so a reference "
+                                 "image cannot be aligned to board coordinates.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(self, "Reference board image", "",
+                                               "Images (*.png *.jpg *.jpeg *.bmp *.tif)")
+        if not path:
+            return
+        image = cv2.imread(path)
+        if image is None:
+            QMessageBox.critical(self, "Could not read image", f"Failed to open {Path(path).name}.")
+            return
+
+        from core.calibration import auto_calibrate
+        result = auto_calibrate(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), fiducials_mm)
+        if not result.success:
+            # Same manual click fallback the live tab uses.
+            from ui.calibration_widget import CalibrationDialog
+            dialog = CalibrationDialog(image, fiducials_mm, parent=self)
+            dialog.widget.status_label.setText("Auto-align: " + result.message)
+            if dialog.exec_() != dialog.Accepted or not dialog.result_calibration:
+                return
+            result = dialog.result_calibration
+
+        self._apply_reference(
+            image, result.homography,
+            f"<b>Reference aligned</b> ({result.method}): {result.inlier_count} fiducials, "
+            f"RMS {result.rms_error_px:.2f}px"
+        )
+
+        from core.reference_image import save_reference
+        try:
+            save_reference(self.program["name"], self.programs_dir, path, result.homography)
+        except OSError as exc:
+            QMessageBox.warning(self, "Reference not saved",
+                                 f"The image is aligned for this session but could not be "
+                                 f"stored with the program:\n{exc}")
+
+    def _apply_reference(self, image, homography, message=None):
+        self.reference_image = image
+        self.reference_homography = homography
+        self.clear_ref_btn.setEnabled(True)
+        self.ref_label.setText(message or "<b>Reference aligned</b> - box is shown over the real part")
+        if self.current_part:
+            self._draw_detail(self.current_part)
+
+    def _load_saved_reference(self):
+        """Restore a previously aligned reference when a program opens."""
+        self.reference_image = None
+        self.reference_homography = None
+        self.clear_ref_btn.setEnabled(False)
+        self.ref_label.setText("No reference image - sizes are set blind")
+        if not self.program:
+            return
+
+        from core.reference_image import load_reference
+        record = load_reference(self.program["name"], self.programs_dir)
+        if not record:
+            return
+        image = cv2.imread(record["image_path"])
+        if image is None:
+            return
+        self.reference_image = image
+        self.reference_homography = record["homography"]
+        self.clear_ref_btn.setEnabled(True)
+        self.ref_label.setText(f"<b>Reference loaded</b>: {Path(record['image_path']).name}")
+
+    def clear_reference_image(self):
+        if not self.program:
+            return
+        from core.reference_image import delete_reference
+        delete_reference(self.program["name"], self.programs_dir)
+        self.reference_image = None
+        self.reference_homography = None
+        self.clear_ref_btn.setEnabled(False)
+        self.ref_label.setText("No reference image - sizes are set blind")
+        if self.current_part:
+            self._draw_detail(self.current_part)
+
+    # ---------- component instances ----------
+    def _load_instances(self, part):
+        from core.reference_image import component_instances
+        self.instances = component_instances(self.program, part) if self.program else []
+        self.instance_index = 0
+        self._update_instance_label()
+
+    def _update_instance_label(self):
+        total = len(self.instances)
+        if not total:
+            self.instance_label.setText("-")
+            self.prev_btn.setEnabled(False)
+            self.next_btn.setEnabled(False)
+            return
+        inst = self.instances[self.instance_index]
+        self.instance_label.setText(
+            f"{inst.get('unit', 'U1')}:{inst.get('designator', '?')}"
+            f"  ({self.instance_index + 1}/{total})"
+            + (f"  {inst.get('rotation', 0):g}°" if inst.get("rotation") else "")
+        )
+        self.prev_btn.setEnabled(total > 1)
+        self.next_btn.setEnabled(total > 1)
+
+    def step_instance(self, delta):
+        """Check the same ROI box against another placement of the part."""
+        if not self.instances:
+            return
+        self.instance_index = (self.instance_index + delta) % len(self.instances)
+        self._update_instance_label()
+        if self.current_part:
+            self._draw_detail(self.current_part)
+
+    def _reference_patch(self, half_extent):
+        """The reference image around the selected instance, resampled
+        into detail-canvas scene space (PX_PER_MM per mm, de-rotated)."""
+        if self.reference_image is None or self.reference_homography is None or not self.instances:
+            return None
+        from core.reference_image import component_patch
+        inst = self.instances[self.instance_index]
+        return component_patch(
+            self.reference_image, self.reference_homography,
+            float(inst["x"]), float(inst["y"]), float(inst.get("rotation", 0.0) or 0.0),
+            half_extent=half_extent, px_per_mm=PX_PER_MM,
+        )
 
     # ---------- overview canvas (read-only context) ----------
     def _draw_overview(self):
@@ -370,24 +558,31 @@ class ProgramTab(QWidget):
             return
         part = current.data(Qt.UserRole)
         self.current_part = part
+        self._load_instances(part)
         self._highlight_part_in_overview(part)
         self._draw_detail(part)
 
     def _draw_detail(self, part):
         self.detail_scene.clear()
+        self._backdrop_item = None  # cleared with the scene; don't reuse the dead item
         size = self.part_sizes.get(part, {"width_mm": DEFAULT_SIZE_MM, "height_mm": DEFAULT_SIZE_MM})
         w_px = size["width_mm"] * PX_PER_MM
         h_px = size["height_mm"] * PX_PER_MM
 
+        # Window first: the reference patch is cut to the same extent, so
+        # the real part sits behind the box at matching scale.
+        self._refit_detail_window(w_px, h_px)
+        self._draw_reference_backdrop()
+
         rect = QRectF(-w_px / 2, -h_px / 2, w_px, h_px)
-        self.current_rect_item = make_resizable_rect_item(rect, on_resize=self._on_canvas_resize)
+        self.current_rect_item = make_resizable_rect_item(
+            rect, on_resize=self._on_canvas_resize, filled=self._backdrop_item is None
+        )
         self.detail_scene.addItem(self.current_rect_item)
 
         cross_pen = QPen(QColor(80, 80, 80))
         self.detail_scene.addLine(-15, 0, 15, 0, cross_pen)
         self.detail_scene.addLine(0, -15, 0, 15, cross_pen)
-
-        self._refit_detail_window(w_px, h_px)
 
         self.width_spin.blockSignals(True)
         self.height_spin.blockSignals(True)
@@ -395,6 +590,24 @@ class ProgramTab(QWidget):
         self.height_spin.setValue(size["height_mm"])
         self.width_spin.blockSignals(False)
         self.height_spin.blockSignals(False)
+
+    def _draw_reference_backdrop(self):
+        """Put the aligned reference image behind the ROI box, centred on
+        the selected component at PX_PER_MM scene pixels per millimetre."""
+        existing = getattr(self, "_backdrop_item", None)
+        if existing is not None and existing.scene() is self.detail_scene:
+            self.detail_scene.removeItem(existing)
+        self._backdrop_item = None
+
+        half = getattr(self, "_detail_half_extent", 160.0)
+        patch = self._reference_patch(half)
+        if patch is None:
+            return
+        item = QGraphicsPixmapItem(bgr_to_qpixmap(patch))
+        item.setOffset(-half, -half)      # scene origin = component centre
+        item.setZValue(-10)               # behind the ROI box and crosshair
+        self.detail_scene.addItem(item)
+        self._backdrop_item = item
 
     def _refit_detail_window(self, w_px, h_px):
         """(Re)fit the detail view's window to comfortably contain a box
@@ -422,6 +635,7 @@ class ProgramTab(QWidget):
         self.height_spin.blockSignals(False)
 
         self._refit_detail_window(width_px, height_px)
+        self._draw_reference_backdrop()  # window grew -> re-cut the patch to match
         self._refresh_current_list_item()
 
     def on_spin_changed(self, _value):
@@ -436,6 +650,7 @@ class ProgramTab(QWidget):
         self.current_rect_item.prepareGeometryChange()
         self.current_rect_item.setRect(-w_px / 2, -h_px / 2, w_px, h_px)
         self._refit_detail_window(w_px, h_px)
+        self._draw_reference_backdrop()  # window grew -> re-cut the patch to match
 
         self._refresh_current_list_item()
 
