@@ -61,6 +61,24 @@ win.resize(1200, 760)
 win.show()
 app.processEvents()
 
+# --- 0. camera selection: no camera attached here, which is the case an
+# operator hits when the index they guessed doesn't exist. The list must
+# say so plainly and Start Live must explain it, not fail silently. ---
+cameras = tab.scan_cameras(show_result=False)
+assert cameras == [], f"no camera should be detected in this environment, got {cameras}"
+assert tab.camera_combo.count() == 1
+assert tab.camera_combo.itemText(0) == "No cameras detected", tab.camera_combo.itemText(0)
+assert tab.camera_combo.currentData() is None
+print("OK: camera scan with none attached ->", tab.camera_combo.itemText(0))
+
+tab.toggle_live()
+app.processEvents()
+assert _dialogs, "Start Live with no camera must explain itself"
+assert "No working camera" in _dialogs[-1][2], _dialogs[-1]
+assert not tab._timer.isActive(), "live view must not start without a camera"
+print("OK: Start Live with no camera warned ->", _dialogs[-1][1])
+_dialogs.clear()
+
 # --- 1. activate program + frame source ---
 tab.set_program(program, PART_SIZES)
 tab.set_source(StillImageSource(image=frame))

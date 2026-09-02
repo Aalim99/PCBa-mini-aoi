@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QMessageBox, QGroupBox, QListWidget, QSpinBox, QFileDialog,
+    QPushButton, QMessageBox, QGroupBox, QListWidget, QComboBox, QFileDialog,
     QShortcut,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -32,7 +32,7 @@ from PyQt5.QtGui import QKeySequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.calibration import CalibrationResult, auto_calibrate
-from core.camera import Camera, StillImageSource
+from core.camera import Camera, StillImageSource, list_cameras
 from core.inspection import InspectionResult, PresenceThresholds, expanded_fiducials_mm, inspect
 from core.barcode_reader import read_barcode
 from core.result_log import append_result
@@ -56,6 +56,7 @@ class LiveTab(QWidget):
         self.part_sizes = {}
         self.calibration: Optional[CalibrationResult] = None
         self.source = None
+        self.cameras = []
         self.live_frame: Optional[np.ndarray] = None
         self.last_result: Optional[InspectionResult] = None
         self.thresholds = PresenceThresholds()
@@ -68,6 +69,9 @@ class LiveTab(QWidget):
         self._timer.timeout.connect(self._grab_frame)
 
         self._build_ui()
+        # Scan after the window has painted: probing absent device indices
+        # takes a moment, and blocking startup on it looks like a hang.
+        QTimer.singleShot(150, lambda: self.scan_cameras(show_result=False))
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -78,10 +82,15 @@ class LiveTab(QWidget):
         left.addWidget(self.canvas, stretch=1)
 
         controls = QHBoxLayout()
-        self.camera_index = QSpinBox()
-        self.camera_index.setRange(0, 9)
         controls.addWidget(QLabel("Camera:"))
-        controls.addWidget(self.camera_index)
+        self.camera_combo = QComboBox()
+        self.camera_combo.setMinimumWidth(230)
+        self.camera_combo.addItem("(not scanned yet)", None)
+        controls.addWidget(self.camera_combo)
+
+        self.rescan_btn = QPushButton("Rescan")
+        self.rescan_btn.clicked.connect(self.scan_cameras)
+        controls.addWidget(self.rescan_btn)
 
         self.start_btn = QPushButton("Start Live")
         self.start_btn.clicked.connect(self.toggle_live)
@@ -164,17 +173,73 @@ class LiveTab(QWidget):
             self.calib_label.setText("<b>Not calibrated</b> - press Calibrate before inspecting")
 
     # ---------- camera ----------
+    def scan_cameras(self, show_result=True):
+        """Populate the camera list with devices that actually deliver a
+        frame, so the operator picks from what exists instead of guessing
+        an index."""
+        self.rescan_btn.setEnabled(False)
+        self.rescan_btn.setText("Scanning...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            cameras = list_cameras()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.rescan_btn.setEnabled(True)
+            self.rescan_btn.setText("Rescan")
+
+        self.cameras = cameras
+        self.camera_combo.clear()
+        if cameras:
+            for info in cameras:
+                self.camera_combo.addItem(info["label"], info["index"])
+        else:
+            self.camera_combo.addItem("No cameras detected", None)
+
+        if show_result and not cameras:
+            QMessageBox.information(
+                self, "No cameras detected",
+                "No working camera was found on indices 0-5.\n\n"
+                "Check that the camera is plugged in and not in use by another "
+                "application (Teams, Zoom, the Windows Camera app), then press "
+                "Rescan. You can also use 'Load Still Image...' to work from a "
+                "saved capture."
+            )
+        return cameras
+
     def toggle_live(self):
         if self._timer.isActive():
             self.stop_live()
             return
-        cam = Camera(self.camera_index.value())
+
+        index = self.camera_combo.currentData()
+        if index is None:
+            # Nothing chosen yet (first run, or the last scan found nothing).
+            cameras = self.scan_cameras(show_result=False)
+            if not cameras:
+                QMessageBox.warning(
+                    self, "No camera",
+                    "No working camera was found on indices 0-5.\n\n"
+                    "Check the camera is plugged in and not already in use by "
+                    "another application, then press Rescan -- or use "
+                    "'Load Still Image...' to work from a saved capture."
+                )
+                return
+            index = self.camera_combo.currentData()
+
+        cam = Camera(index)
         if not cam.open():
-            QMessageBox.warning(self, "No camera",
-                                 f"Could not open camera #{self.camera_index.value()}.\n"
-                                 "Attach a camera, or use 'Load Still Image...' instead.")
+            detected = ", ".join(str(c["index"]) for c in self.cameras) or "none"
+            QMessageBox.warning(
+                self, "Could not open camera",
+                f"Camera {index} did not open.\n\n"
+                f"Currently detected: {detected}.\n"
+                "It may have been unplugged or claimed by another application. "
+                "Press Rescan to refresh the list."
+            )
             return
         self.set_source(cam)
+        self.calib_label.setToolTip(f"Live source: {cam.description}")
 
     def set_source(self, source):
         self.stop_live()
