@@ -143,6 +143,14 @@ class LiveTab(QWidget):
         self.resume_btn.clicked.connect(self.resume_live)
         row.addWidget(self.resume_btn)
         source_card.body.addLayout(row)
+
+        # Only shown when something is actually wrong with the feed, so
+        # a blank picture is explained rather than left to interpret.
+        self.source_warning = QLabel("")
+        self.source_warning.setWordWrap(True)
+        self.source_warning.setStyleSheet(f"color: {COLORS['warn']};")
+        self.source_warning.hide()
+        source_card.body.addWidget(self.source_warning)
         column.addWidget(source_card)
 
         actions = QHBoxLayout()
@@ -362,6 +370,7 @@ class LiveTab(QWidget):
     def set_source(self, source):
         self.stop_live()
         self.resume_live()
+        self.source_warning.hide()
         self.source = source
         if not source.is_open and not source.open():
             QMessageBox.warning(self, "Source unavailable", f"Could not open {source.description}.")
@@ -369,6 +378,21 @@ class LiveTab(QWidget):
             return
         self._timer.start(33)
         self.start_btn.setText("Stop Live")
+        self._warn_if_blank(source)
+
+    def _warn_if_blank(self, source):
+        """A camera whose pixel format could not be negotiated returns a
+        flat colour rather than failing, which otherwise reaches the
+        operator as an unexplained blank rectangle."""
+        if not getattr(source, "delivers_blank_frames", False):
+            return
+        self.source_warning.setText(
+            f"{source.description} opens but returns blank frames — no image data. "
+            "Usually the resolution is more than the USB link can carry. Try another "
+            "camera entry, close any other app using it, or plug it into a USB 3 port. "
+            "Run scripts/camera_probe.py to see which formats this camera can deliver."
+        )
+        self.source_warning.show()
 
     def stop_live(self):
         self._timer.stop()
