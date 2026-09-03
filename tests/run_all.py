@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 TESTS = [
+    "test_csv_import.py",
     "test_calibration.py",
     "test_inspection.py",
     "test_barcode_and_log.py",

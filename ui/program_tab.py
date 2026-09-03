@@ -360,7 +360,11 @@ class ProgramTab(QWidget):
     def import_xy_dialog(self):
         """Parse a mounter XY export into a new program JSON."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import mounter XY file", "", "Excel files (*.xlsx *.xls)"
+            self, "Import mounter XY file", "",
+            "XY files (*.xlsx *.xls *.csv *.tsv *.txt);;"
+            "Excel files (*.xlsx *.xls);;"
+            "Text files (*.csv *.tsv *.txt);;"
+            "All files (*)"
         )
         if not path:
             return
@@ -379,14 +383,20 @@ class ProgramTab(QWidget):
             return
 
         unsized = [p for p in program["unknown_parts"] if p not in self.part_sizes]
-        QMessageBox.information(
-            self, "Program imported",
+        summary = (
             f"Saved to {out_path}\n\n"
             f"Components: {len(program['components'])}\n"
             f"Fiducials: {len(program['fiducials'])}\n"
             f"Panel offsets: {len(program['panel_offsets'])}\n"
             f"Part numbers still needing an ROI size: {len(unsized)}"
         )
+        # Anything the parser had to assume is shown, not buried: a file
+        # with no Type or Part column still imports, but the operator
+        # needs to know which columns were not found.
+        notes = program.get("notes") or []
+        if notes:
+            summary += "\n\nNotes:\n" + "\n".join(f"• {n}" for n in notes)
+        QMessageBox.information(self, "Program imported", summary)
         self.load_program(out_path)
 
     def load_program_dialog(self):
