@@ -17,8 +17,7 @@ import numpy as np
 
 import core.camera as camera_module
 from core.camera import (
-    Camera, StillImageSource, backend_candidates, backend_name,
-    frame_is_blank, normalise_frame,
+    Camera, StillImageSource, backend_candidates, frame_is_blank, normalise_frame,
 )
 
 
