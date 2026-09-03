@@ -32,7 +32,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from core.calibration import mm_to_px_batch
@@ -291,8 +290,13 @@ def check_presence(crop: np.ndarray, thresholds: PresenceThresholds) -> Tuple[bo
 # Top level
 # ---------------------------------------------------------------------
 
-def to_gray(frame: np.ndarray) -> np.ndarray:
-    return frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def to_gray(frame: np.ndarray, gray_settings=None) -> np.ndarray:
+    """Reduce a frame to the channel the presence check measures. Which
+    channel, and how it is toned, is a tuning knob -- see core.grayscale."""
+    if frame.ndim == 2 and gray_settings is None:
+        return frame
+    from core.grayscale import to_gray as _to_gray
+    return _to_gray(frame, gray_settings)
 
 
 def _verdict_for(units: List[UnitResult]) -> Tuple[str, str]:
@@ -344,6 +348,7 @@ def inspect(
     panel_mode: Optional[str] = None,
     barcode: Optional[str] = None,
     part_thresholds: Optional[Dict[str, dict]] = None,
+    gray_settings=None,
 ) -> InspectionResult:
     """Run one inspection pass over a captured frame.
 
@@ -355,7 +360,7 @@ def inspect(
     from core.thresholds import effective_thresholds
 
     thresholds = thresholds or PresenceThresholds()
-    gray = to_gray(frame)
+    gray = to_gray(frame, gray_settings)
     mode = panel_mode or detect_panel_mode(program)
     items = expand_components(program, mode)
 

@@ -18,7 +18,11 @@ In **Program Manager**:
 1. **Import XY…** — parse the mounter's pick-and-place export into a
    program: components, fiducials, and panel offsets.
 2. **Load Reference…** — a photo of a known-good board, aligned to the
-   program's fiducials. Everything below depends on it.
+   program's fiducials. Everything below depends on it, so the alignment
+   is always put in front of you to confirm: click F1, F2 and F3 on the
+   photo (each named as you go), or accept the automatic fit when the
+   marks are found. A silently wrong reference would corrupt every ROI
+   size and every taught template downstream.
 3. **Alignment fiducials** — define **F1/F2/F3**, the three points the
    station aligns every board from. *Auto-suggest* picks a well-spread
    trio from the XY file; the dropdown chooses a specific one; **Pick**
@@ -27,7 +31,10 @@ In **Program Manager**:
    draws the marks and the triangle they form — a long thin triangle
    pins rotation poorly, which a list of coordinates won't show you.
 4. **ROI size** — select a part number and size its box by dragging a
-   corner or typing millimetres. With a reference loaded, the real
+   corner or typing millimetres. The box reports its size in millimetres
+   while you drag it, on the panel and on the canvas, so you can tune
+   against the part instead of dragging and then reading a spin box.
+   With a reference loaded, the real
    component sits behind the box at true scale, de-rotated, and
    *Prev/Next* steps through its other placements (all panel units
    included). Sizes live in a shared `programs/part_sizes.json` that
@@ -59,6 +66,18 @@ Two controls, for two different problems:
   Select the finding and press it; the threshold for that part number
   moves to just under what it actually measured.
 
+A third control sits below them, for when neither helps because the
+parts simply don't stand out from the board:
+
+- **Grayscale** — which single channel the presence check measures, plus
+  gamma, contrast and brightness. On a green solder mask the red channel
+  often doubles the separation between a part and the bare board, where
+  plain luma averages it away. **Preview** shows exactly what the check
+  sees. Unlike the two controls above this re-measures the capture rather
+  than re-deciding it, and the settings are saved with **Save Tuning** to
+  `programs/grayscale.json` — they describe the station's lighting and
+  camera, so they are shared across programs.
+
 Both re-decide the capture already on screen, from measurements already
 taken — so you see the effect on the board that prompted the change, with
 no re-shoot. Each finding shows how close the call was (`0.62x` means it
@@ -82,6 +101,7 @@ verdict and free text, from `logs/results.csv`.
 | `core/barcode_reader.py` | Traceability code from the inspection frame |
 | `core/result_log.py` | Append/read the results CSV |
 | `core/camera.py` | Camera with backend fallback, plus a still-image stand-in |
+| `core/grayscale.py` | Channel choice and tone curve for the presence check |
 | `core/testutils.py` | Synthetic board frames (dev/test only) |
 | `ui/theme.py` | Dark theme and shared widgets |
 | `ui/` | The three tabs, the fiducial panel, the alignment widget |
@@ -91,7 +111,7 @@ Each UI module runs standalone for testing, e.g. `python ui/live_tab.py`.
 ## Tests
 
 ```bash
-QT_QPA_PLATFORM=offscreen python tests/run_all.py     # 12 suites
+QT_QPA_PLATFORM=offscreen python tests/run_all.py     # 17 suites
 QT_QPA_PLATFORM=offscreen python scripts/shoot_ui.py  # screenshots of every tab
 ```
 
@@ -119,5 +139,10 @@ Worth knowing before trusting a verdict:
   Offsets to repeat. Which one is inferred from the data; set
   `"panel_mode": "expanded"` or `"replicate"` in the program JSON to pin
   it once the real board's file settles the question.
+- **Blob auto-alignment is unreliable on a repetitive panel.** Every
+  unit of a 5-up panel looks the same to the blob detector, so it
+  reports the layout as ambiguous rather than guessing — which is the
+  correct answer, not a bug. The taught F1/F2/F3 templates are the path
+  that works there; the three named manual clicks are the fallback.
 - **Dust/dirt detection is not built** — planned as anomaly detection
   outside the known component ROIs.

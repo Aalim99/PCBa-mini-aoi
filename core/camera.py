@@ -72,6 +72,13 @@ class CameraSource:
         return False
 
     @property
+    def is_static(self) -> bool:
+        """True when the source never changes, so the caller can read it
+        once instead of polling. Re-converting a large still frame many
+        times a second is pure waste and can saturate a UI."""
+        return False
+
+    @property
     def description(self) -> str:
         return "unknown source"
 
@@ -287,6 +294,10 @@ class StillImageSource(CameraSource):
     @property
     def is_open(self) -> bool:
         return self._open
+
+    @property
+    def is_static(self) -> bool:
+        return True
 
     @property
     def description(self) -> str:

@@ -39,6 +39,11 @@ import numpy as np
 
 Point = Tuple[float, float]
 
+# Blob search is done at no more than this on the long edge. A fiducial
+# pad spans many pixels at any usable working distance, so the extra
+# resolution only buys contour noise and seconds of runtime.
+DETECT_MAX_DIMENSION = 2000
+
 
 @dataclass
 class CalibrationResult:
@@ -85,7 +90,19 @@ def detect_fiducial_candidates(
     Both polarities are thresholded (Otsu) and searched, since a
     fiducial's brightness relative to the surrounding solder mask can
     go either way depending on finish and lighting.
+
+    Large frames are searched at reduced resolution and the results
+    scaled back: a 37MP capture otherwise spends seconds finding
+    thousands of contours, and a fiducial pad is many pixels across at
+    any sane working distance, so the detail is not needed to locate it.
     """
+    shrink = 1.0
+    if max(gray.shape[:2]) > DETECT_MAX_DIMENSION:
+        shrink = DETECT_MAX_DIMENSION / max(gray.shape[:2])
+        gray = cv2.resize(gray, None, fx=shrink, fy=shrink, interpolation=cv2.INTER_AREA)
+        min_radius_px *= shrink
+        max_radius_px *= shrink
+
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     found = []
     for invert in (False, True):
@@ -115,7 +132,8 @@ def detect_fiducial_candidates(
             continue
         deduped.append((x, y, r, c))
 
-    return [(x, y, r) for x, y, r, _ in deduped]
+    back = 1.0 / shrink
+    return [(x * back, y * back, r * back) for x, y, r, _ in deduped]
 
 
 # ---------------------------------------------------------------------
@@ -253,15 +271,37 @@ def find_correspondence_ransac(
 # 3. Homography fitting
 # ---------------------------------------------------------------------
 
+def is_usable_transform(H) -> bool:
+    """Reject a transform that cannot actually be used to project points:
+    non-finite, not invertible, or with a collapsed linear part (every
+    point mapped onto a line)."""
+    if H is None:
+        return False
+    H = np.asarray(H, dtype=np.float64)
+    if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+        return False
+    if abs(H[2, 2]) < 1e-12:
+        return False
+    if abs(np.linalg.det(H[:2, :2])) < 1e-9:
+        return False
+    try:
+        np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
 def fit_homography(matched_mm: List[Point], matched_px: List[Point]):
-    """Fit the final mm->px homography from point correspondences.
-    Needs >=4 points for a full (perspective) homography; degrades to
-    an affine transform for exactly 3 points, and a similarity
-    transform for exactly 2 -- both embedded in a 3x3 matrix so callers
-    can treat the result uniformly. A flat 2-3 point homography would
-    be underdetermined and cv2.findHomography refuses it outright, so
-    those cases use the lower-DOF fit that IS fully determined by the
-    points available.
+    """Fit the final mm->px transform from point correspondences, using
+    the most general model the points can actually support.
+
+    A full 8-DOF homography needs 4+ points with no three collinear.
+    Real boards routinely break that: fiducials along one edge, or two
+    rows across a panel, put every 4-point sample on a pair of lines and
+    cv2.findHomography then fails outright. So each model is tried in
+    turn -- homography, affine, similarity -- and the first that yields a
+    usable transform wins. The result is always a 3x3 matrix so callers
+    need not care which model was used.
 
     Returns (H, rms_error_px), or (None, inf) on failure.
     """
@@ -272,21 +312,32 @@ def fit_homography(matched_mm: List[Point], matched_px: List[Point]):
     mm = np.asarray(matched_mm, dtype=np.float64)
     px = np.asarray(matched_px, dtype=np.float64)
 
+    candidates = []
     if n >= 4:
         H, _ = cv2.findHomography(mm, px, cv2.RANSAC, 5.0)
-    elif n == 3:
-        affine = cv2.getAffineTransform(mm.astype(np.float32), px.astype(np.float32))
-        H = np.vstack([affine, [0, 0, 1]])
-    else:  # n == 2
-        affine = _similarity_from_pair(tuple(mm[0]), tuple(mm[1]), tuple(px[0]), tuple(px[1]))
-        H = np.vstack([affine, [0, 0, 1]]) if affine is not None else None
+        candidates.append(H)
+    if n >= 3:
+        affine, _ = cv2.estimateAffine2D(mm, px, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+        if affine is not None:
+            candidates.append(np.vstack([affine, [0, 0, 1]]))
+    if n >= 2:
+        similarity, _ = cv2.estimateAffinePartial2D(
+            mm, px, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+        if similarity is not None:
+            candidates.append(np.vstack([similarity, [0, 0, 1]]))
+        pair = _similarity_from_pair(tuple(mm[0]), tuple(mm[1]), tuple(px[0]), tuple(px[1]))
+        if pair is not None:
+            candidates.append(np.vstack([pair, [0, 0, 1]]))
 
-    if H is None:
-        return None, float("inf")
+    for H in candidates:
+        if not is_usable_transform(H):
+            continue
+        projected = mm_to_px_batch(H, mm)
+        rms = float(np.sqrt(np.mean(np.sum((projected - px) ** 2, axis=1))))
+        if np.isfinite(rms):
+            return H, rms
 
-    projected = mm_to_px_batch(H, mm)
-    rms = float(np.sqrt(np.mean(np.sum((projected - px) ** 2, axis=1))))
-    return H, rms
+    return None, float("inf")
 
 
 def mm_to_px_batch(H: np.ndarray, mm_points: np.ndarray) -> np.ndarray:
@@ -330,6 +381,10 @@ def auto_calibrate(
             message=f"Only {len(candidates)} circular fiducial candidate(s) detected in frame.",
         )
 
+    # Every candidate is kept on purpose. Trimming the list to speed the
+    # search up also removes the rival hypotheses the ambiguity check
+    # relies on, which turns an honest "ambiguous" into a confident
+    # wrong answer -- the one failure this must never produce.
     candidates_px = [(x, y) for x, y, _r in candidates]
     affine, matched_mm, matched_px, inlier_count, ambiguous = find_correspondence_ransac(
         fiducials_mm, candidates_px, inlier_thresh_px=inlier_thresh_px, iterations=ransac_iterations,

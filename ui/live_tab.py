@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QShortcut, QSlider, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtGui import QColor, QKeySequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.calibration import CalibrationResult, auto_calibrate
@@ -44,6 +44,10 @@ from core.inspection import (
     InspectionResult, PresenceThresholds, expanded_fiducials_mm, inspect, reevaluate,
 )
 from core.barcode_reader import read_barcode
+from core.grayscale import (
+    MODES as GRAY_MODES, MODE_LABELS as GRAY_MODE_LABELS, GrayscaleSettings,
+    load_grayscale_settings, save_grayscale_settings, to_gray as gray_convert,
+)
 from core.result_log import append_result
 from core.thresholds import (
     MAX_SENSITIVITY, MIN_SENSITIVITY, clamp_sensitivity, load_part_thresholds,
@@ -53,6 +57,9 @@ from ui.calibration_widget import ImageCanvas, CalibrationDialog
 from ui.theme import COLORS, Card, muted_label, verdict_style
 
 SLIDER_STEPS = 100
+# Cap on findings listed: an unsized program reports every component as
+# unchecked, and hundreds of rows is slow to build and unreadable.
+MAX_FINDINGS_SHOWN = 200
 
 
 def _sensitivity_from_slider(value: int) -> float:
@@ -72,14 +79,18 @@ class LiveTab(QWidget):
     inspected = pyqtSignal(object)  # InspectionResult, so the logs tab can refresh
 
     def __init__(self, log_path="logs/results.csv", programs_dir="programs",
-                 part_thresholds_path="programs/part_thresholds.json"):
+                 part_thresholds_path="programs/part_thresholds.json",
+                 grayscale_path=None):
         super().__init__()
         self.log_path = log_path
         self.programs_dir = programs_dir
         self.part_thresholds_path = part_thresholds_path
+        self.grayscale_path = grayscale_path or str(
+            Path(part_thresholds_path).with_name("grayscale.json"))
         self.program: Optional[dict] = None
         self.part_sizes = {}
         self.part_thresholds = load_part_thresholds(part_thresholds_path)
+        self.gray_settings = load_grayscale_settings(self.grayscale_path)
         self.calibration: Optional[CalibrationResult] = None
         self.fiducial_templates = {}
         self.source = None
@@ -240,9 +251,69 @@ class LiveTab(QWidget):
         buttons.addWidget(self.save_tuning_btn)
         tuning.body.addLayout(buttons)
         column.addWidget(tuning)
-
         self._update_sensitivity_label()
+
+        column.addWidget(self._build_grayscale_card())
         return column
+
+    def _build_grayscale_card(self):
+        """Which channel the presence check measures, and how it is toned.
+        On a green board the red channel often separates parts from the
+        mask far better than luma, which changes every measurement."""
+        card = Card("Grayscale")
+        self.gray_summary = muted_label("")
+        card.body.addWidget(self.gray_summary)
+
+        row = QHBoxLayout()
+        label = QLabel("Channel")
+        label.setProperty("variant", "muted")
+        row.addWidget(label)
+        self.gray_mode_combo = QComboBox()
+        for mode in GRAY_MODES:
+            self.gray_mode_combo.addItem(GRAY_MODE_LABELS[mode], mode)
+        self.gray_mode_combo.setCurrentIndex(
+            max(0, GRAY_MODES.index(self.gray_settings.mode)))
+        self.gray_mode_combo.currentIndexChanged.connect(self._on_grayscale_changed)
+        row.addWidget(self.gray_mode_combo, stretch=1)
+        card.body.addLayout(row)
+
+        self.gamma_slider = self._tone_slider(
+            card, "Gamma", 20, 300, int(self.gray_settings.gamma * 100))
+        self.contrast_slider = self._tone_slider(
+            card, "Contrast", 20, 300, int(self.gray_settings.contrast * 100))
+        self.brightness_slider = self._tone_slider(
+            card, "Brightness", -100, 100, int(self.gray_settings.brightness))
+
+        actions = QHBoxLayout()
+        self.gray_reset_btn = QPushButton("Reset")
+        self.gray_reset_btn.setProperty("variant", "ghost")
+        self.gray_reset_btn.clicked.connect(self.reset_grayscale)
+        actions.addWidget(self.gray_reset_btn)
+        self.gray_preview_btn = QPushButton("Preview")
+        self.gray_preview_btn.setProperty("variant", "ghost")
+        self.gray_preview_btn.setCheckable(True)
+        self.gray_preview_btn.setToolTip(
+            "Show the capture as the presence check actually sees it")
+        self.gray_preview_btn.clicked.connect(self._on_preview_toggled)
+        actions.addWidget(self.gray_preview_btn)
+        card.body.addLayout(actions)
+
+        self._update_grayscale_summary()
+        return card
+
+    def _tone_slider(self, card, name, low, high, value):
+        row = QHBoxLayout()
+        label = QLabel(name)
+        label.setProperty("variant", "muted")
+        label.setMinimumWidth(74)
+        row.addWidget(label)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(low, high)
+        slider.setValue(value)
+        slider.valueChanged.connect(self._on_grayscale_changed)
+        row.addWidget(slider, stretch=1)
+        card.body.addLayout(row)
+        return slider
 
     def _style_verdict(self, verdict):
         fg, bg = verdict_style(verdict)
@@ -376,8 +447,15 @@ class LiveTab(QWidget):
             QMessageBox.warning(self, "Source unavailable", f"Could not open {source.description}.")
             self.source = None
             return
-        self._timer.start(33)
-        self.start_btn.setText("Stop Live")
+
+        if getattr(source, "is_static", False):
+            # A still image never changes: read it once. Polling it would
+            # re-convert the whole frame every tick for no new information.
+            self._grab_frame()
+            self.start_btn.setText("Start Live")
+        else:
+            self._timer.start(33)
+            self.start_btn.setText("Stop Live")
         self._warn_if_blank(source)
 
     def _warn_if_blank(self, source):
@@ -496,7 +574,8 @@ class LiveTab(QWidget):
         barcode = read_barcode(frame)
         result = inspect(frame, self.program, self.part_sizes, self.calibration.homography,
                          thresholds=self.thresholds, barcode=barcode,
-                         part_thresholds=self.part_thresholds)
+                         part_thresholds=self.part_thresholds,
+                         gray_settings=self.gray_settings)
         self.last_result = result
 
         self._frozen = True
@@ -541,7 +620,14 @@ class LiveTab(QWidget):
             self.canvas.set_frame(self._overlay(self.captured_frame, result))
 
         self.missing_list.clear()
+        # A program whose parts are not yet sized reports every component
+        # as unchecked; listing hundreds of rows is slow and tells the
+        # operator nothing they cannot read from the counts.
+        shown = 0
         for comp in result.missing:
+            if shown >= MAX_FINDINGS_SHOWN:
+                break
+            shown += 1
             item = QListWidgetItem(
                 f"MISSING   {comp.unit}:{comp.designator}   {comp.part or '-'}"
                 f"      {comp.margin:.2f}x"
@@ -554,9 +640,19 @@ class LiveTab(QWidget):
             )
             self.missing_list.addItem(item)
         for comp in result.unchecked:
+            if shown >= MAX_FINDINGS_SHOWN:
+                break
+            shown += 1
             item = QListWidgetItem(f"UNCHECKED   {comp.unit}:{comp.designator}   ({comp.status})")
             item.setData(Qt.UserRole, None)
             self.missing_list.addItem(item)
+
+        hidden = len(result.missing) + len(result.unchecked) - shown
+        if hidden > 0:
+            more = QListWidgetItem(f"… and {hidden} more (see the CSV log for the full list)")
+            more.setData(Qt.UserRole, None)
+            more.setForeground(QColor(COLORS["faint"]))
+            self.missing_list.addItem(more)
 
         units = ", ".join(f"{u.label}={'PASS' if u.passed else 'FAIL'}" for u in result.units)
         self.units_label.setText(f"{result.message}<br>Units: {units}")
@@ -606,6 +702,66 @@ class LiveTab(QWidget):
         self._update_sensitivity_label()
         self._reevaluate_current()
 
+    # ---------- grayscale ----------
+    def _on_grayscale_changed(self, _value=None):
+        self.gray_settings = GrayscaleSettings(
+            mode=self.gray_mode_combo.currentData() or "luma",
+            gamma=self.gamma_slider.value() / 100.0,
+            contrast=self.contrast_slider.value() / 100.0,
+            brightness=float(self.brightness_slider.value()),
+        )
+        self._update_grayscale_summary()
+        # Changing the channel changes what every ROI measures, so this
+        # cannot be re-decided from stored numbers the way sensitivity is
+        # -- the capture has to be measured again.
+        self._remeasure_current()
+        if self.gray_preview_btn.isChecked():
+            self._show_grayscale_preview()
+
+    def _update_grayscale_summary(self):
+        self.gray_summary.setText(self.gray_settings.summary())
+
+    def _remeasure_current(self):
+        """Re-run the presence measurement over the held capture."""
+        if self.captured_frame is None or not self.program or not self.calibration:
+            return
+        result = inspect(self.captured_frame, self.program, self.part_sizes,
+                         self.calibration.homography, thresholds=self.thresholds,
+                         barcode=self.last_result.barcode if self.last_result else None,
+                         part_thresholds=self.part_thresholds,
+                         gray_settings=self.gray_settings)
+        self.last_result = result
+        self._show_result(result)
+
+    def _on_preview_toggled(self, checked):
+        if checked:
+            self._show_grayscale_preview()
+        elif self.last_result is not None:
+            self._show_result(self.last_result)
+        elif self.live_frame is not None:
+            self.canvas.set_frame(self.live_frame)
+
+    def _show_grayscale_preview(self):
+        frame = self.captured_frame if self.captured_frame is not None else self.live_frame
+        if frame is None:
+            return
+        gray = gray_convert(frame, self.gray_settings)
+        self.canvas.set_frame(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
+
+    def reset_grayscale(self):
+        self.gray_settings = GrayscaleSettings()
+        for widget, value in ((self.gray_mode_combo, 0),
+                              (self.gamma_slider, 100),
+                              (self.contrast_slider, 100),
+                              (self.brightness_slider, 0)):
+            widget.blockSignals(True)
+            widget.setCurrentIndex(value) if widget is self.gray_mode_combo else widget.setValue(value)
+            widget.blockSignals(False)
+        self._update_grayscale_summary()
+        self._remeasure_current()
+        if self.gray_preview_btn.isChecked():
+            self._show_grayscale_preview()
+
     def reset_tuning(self):
         if self.part_thresholds and QMessageBox.question(
             self, "Reset tuning",
@@ -625,14 +781,15 @@ class LiveTab(QWidget):
     def save_tuning(self):
         try:
             save_part_thresholds(self.part_thresholds_path, self.part_thresholds)
+            save_grayscale_settings(self.grayscale_path, self.gray_settings)
         except OSError as exc:
             QMessageBox.warning(self, "Could not save", str(exc))
             return
         QMessageBox.information(
             self, "Tuning saved",
-            f"Sensitivity {self.thresholds.sensitivity:.2f}x and "
-            f"{len(self.part_thresholds)} per-part threshold(s) saved to\n"
-            f"{self.part_thresholds_path}"
+            f"Sensitivity {self.thresholds.sensitivity:.2f}x, "
+            f"{len(self.part_thresholds)} per-part threshold(s) and grayscale "
+            f"({self.gray_settings.summary()}) saved to\n{self.part_thresholds_path}"
         )
 
     # ---------- helpers ----------

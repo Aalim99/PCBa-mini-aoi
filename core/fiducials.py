@@ -196,6 +196,32 @@ def delete_templates(program_name: str, programs_dir: str, ids=DEFAULT_IDS) -> N
 # Matching
 # ---------------------------------------------------------------------
 
+def _subpixel_offset(response: np.ndarray, x: int, y: int) -> Tuple[float, float]:
+    """Sub-pixel correction of a correlation peak by fitting a parabola
+    through its immediate neighbours on each axis.
+
+    The correlation surface around a true match is smooth and roughly
+    quadratic, so the vertex of that parabola locates the peak far more
+    precisely than the integer cell that merely contains it.
+    """
+    h, w = response.shape[:2]
+    if not (0 < x < w - 1 and 0 < y < h - 1):
+        return 0.0, 0.0
+
+    def vertex(before: float, centre: float, after: float) -> float:
+        denominator = before - 2.0 * centre + after
+        if abs(denominator) < 1e-12:
+            return 0.0
+        # Clamped: a flat or noisy surface can otherwise throw the vertex
+        # outside the cell it was found in, which is never a refinement.
+        return float(np.clip(0.5 * (before - after) / denominator, -0.5, 0.5))
+
+    centre = float(response[y, x])
+    dx = vertex(float(response[y, x - 1]), centre, float(response[y, x + 1]))
+    dy = vertex(float(response[y - 1, x]), centre, float(response[y + 1, x]))
+    return dx, dy
+
+
 def match_template_peaks(gray: np.ndarray, template: np.ndarray, top_k: int = 6,
                          scales=DEFAULT_SCALES, min_score: float = 0.45
                          ) -> List[Tuple[float, float, float, float]]:
@@ -205,6 +231,11 @@ def match_template_peaks(gray: np.ndarray, template: np.ndarray, top_k: int = 6,
     differ slightly from the reference shot. Peaks are suppressed within
     roughly a template width of each other so one strong match doesn't
     return as a cluster of near-duplicates.
+
+    Peak positions are refined to sub-pixel precision, which matters:
+    the whole board's alignment is fitted from these few points, so a
+    half-pixel bias at a fiducial becomes a bias at every ROI across the
+    board -- and at 35 px/mm, one pixel is already 0.03mm of drift.
     """
     peaks: List[Tuple[float, float, float, float]] = []
     for scale in scales:
@@ -219,8 +250,9 @@ def match_template_peaks(gray: np.ndarray, template: np.ndarray, top_k: int = 6,
             _min_v, max_v, _min_l, max_l = cv2.minMaxLoc(work)
             if max_v < min_score:
                 break
-            cx = max_l[0] + tw / 2.0
-            cy = max_l[1] + th / 2.0
+            dx, dy = _subpixel_offset(response, max_l[0], max_l[1])
+            cx = max_l[0] + dx + tw / 2.0
+            cy = max_l[1] + dy + th / 2.0
             peaks.append((float(cx), float(cy), float(max_v), float(scale)))
             x0 = max(0, max_l[0] - tw // 2)
             y0 = max(0, max_l[1] - th // 2)

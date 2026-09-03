@@ -14,6 +14,8 @@ TESTS = [
     "test_inspection.py",
     "test_barcode_and_log.py",
     "test_fiducials.py",
+    "test_grayscale.py",
+    "test_alignment_robustness.py",
     "test_tuning_and_editing.py",
     "test_reference_image.py",
     "test_program_tab_smoke.py",
@@ -21,6 +23,7 @@ TESTS = [
     "test_calibration_widget_smoke.py",
     "test_live_tab_smoke.py",
     "test_ui_features_smoke.py",
+    "test_ui_readouts_smoke.py",
     "test_main_integration.py",
 ]
 

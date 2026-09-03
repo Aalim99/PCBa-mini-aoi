@@ -60,11 +60,32 @@ class ImageCanvas(QLabel):
         self._redraw()
 
     def _redraw(self):
-        if self._frame_bgr is None:
+        frame = self._frame_bgr
+        if frame is None:
             return
-        pix = _to_qpixmap(self._frame_bgr)
+        native_h, native_w = frame.shape[:2]
+        if native_w == 0 or native_h == 0:
+            return
+
+        # Downscale with OpenCV BEFORE building the pixmap. A 37MP capture
+        # costs ~1.8s to convert whole, which at 30fps saturates the UI and
+        # leaves the view seemingly frozen -- but the label only ever shows
+        # it at widget size, so converting the full frame is wasted work.
+        view_w = max(self.width(), 1)
+        view_h = max(self.height(), 1)
+        shrink = min(view_w / native_w, view_h / native_h, 1.0)
+        if shrink < 1.0:
+            frame = cv2.resize(
+                frame,
+                (max(1, int(native_w * shrink)), max(1, int(native_h * shrink))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        pix = _to_qpixmap(frame)
         scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._display_scale = scaled.width() / pix.width() if pix.width() else 1.0
+        # Scale is kept relative to the NATIVE frame, so clicks still map
+        # back to full-resolution pixel coordinates.
+        self._display_scale = scaled.width() / native_w
         self._display_offset = (
             (self.width() - scaled.width()) / 2.0,
             (self.height() - scaled.height()) / 2.0,
@@ -241,7 +262,8 @@ class CalibrationDialog(QDialog):
     """Modal wrapper around CalibrationWidget, for calibrating from the
     Live Inspection tab. Accepts once a calibration succeeds."""
 
-    def __init__(self, frame_bgr, fiducials_mm, parent=None, labels=None):
+    def __init__(self, frame_bgr, fiducials_mm, parent=None, labels=None,
+                 start_manual=True, initial_result=None):
         super().__init__(parent)
         self.setWindowTitle("Align Board")
         self.resize(900, 720)
@@ -256,6 +278,7 @@ class CalibrationDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         self.use_btn = QPushButton("Use This Calibration")
+        self.use_btn.setProperty("variant", "primary")
         self.use_btn.setEnabled(False)
         self.use_btn.clicked.connect(self.accept)
         buttons.addWidget(self.use_btn)
@@ -263,6 +286,24 @@ class CalibrationDialog(QDialog):
         cancel.clicked.connect(self.reject)
         buttons.addWidget(cancel)
         layout.addLayout(buttons)
+
+        if initial_result is not None and initial_result.success:
+            # Show what automatic alignment found so it can be checked
+            # before it is trusted. A wrong alignment here is silent and
+            # poisons everything downstream -- ROI sizes, taught
+            # fiducials, every later inspection.
+            self.widget.result = initial_result
+            self.widget._draw_overlay()
+            self.widget.status_label.setText(
+                "Auto-align: " + initial_result.message +
+                "  —  check the marks sit on the fiducials, then Use This Calibration. "
+                "If they do not, press Start Manual Calibration."
+            )
+            self._on_calibrated(initial_result)
+        elif start_manual:
+            # Nothing to check: go straight to clicking rather than
+            # making the operator press another button to begin.
+            self.widget.start_manual_calibration()
 
     def _on_calibrated(self, result):
         self.result_calibration = result

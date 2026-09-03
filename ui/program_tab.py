@@ -45,7 +45,8 @@ def bgr_to_qpixmap(bgr):
     return QPixmap.fromImage(QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy())
 
 
-def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0), filled=True):
+def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0), filled=True,
+                             on_resizing=None):
     """Factory returning a QGraphicsRectItem subclass instance with
     corner-drag resizing. Position is NOT draggable — only size
     changes, since the item represents a component's ROI box size,
@@ -125,6 +126,11 @@ def make_resizable_rect_item(rect, on_resize=None, color=QColor(255, 140, 0), fi
                 if r.width() > self.HANDLE_SIZE and r.height() > self.HANDLE_SIZE:
                     self.prepareGeometryChange()
                     self.setRect(r)
+                    # Report during the drag, not only on release: the
+                    # operator is sizing against a real part and needs to
+                    # see the millimetres change as they move.
+                    if on_resizing:
+                        on_resizing(r.width(), r.height())
                 event.accept()
             else:
                 super().mouseMoveEvent(event)
@@ -307,6 +313,16 @@ class ProgramTab(QWidget):
         roi_card = Card("ROI size")
         self.roi_hint = muted_label("Drag a corner, or type exact millimetres")
         roi_card.body.addWidget(self.roi_hint)
+
+        # Live dimensions, big enough to read while dragging.
+        self.size_readout = QLabel("—")
+        self.size_readout.setAlignment(Qt.AlignCenter)
+        self.size_readout.setStyleSheet(
+            f"color:{COLORS['accent']}; font-size:19px; font-weight:700;"
+            f"background:{COLORS['raised']}; border:1px solid {COLORS['border']};"
+            "border-radius:7px; padding:6px;"
+        )
+        roi_card.body.addWidget(self.size_readout)
 
         self.detail_scene = QGraphicsScene()
         self.detail_view = QGraphicsView(self.detail_scene)
@@ -560,33 +576,63 @@ class ProgramTab(QWidget):
             QMessageBox.warning(self, "No program", "Load a program first.")
             return
 
-        from core.inspection import expanded_fiducials_mm
-        fiducials_mm = expanded_fiducials_mm(self.program)
-        if len(fiducials_mm) < 2:
+        # Align on the three named fiducials, not every Pattern Fiducial
+        # row. A panel of repeated units lists one pair per unit, and
+        # asking the operator to click ten identical marks (in the right
+        # order) is both slow and easy to get wrong.
+        from core.fiducials import get_fiducial_refs, set_fiducial_refs, suggest_fiducial_refs
+
+        refs = get_fiducial_refs(self.program)
+        if not refs:
+            refs = suggest_fiducial_refs(self.program)
+            if refs:
+                set_fiducial_refs(self.program, refs)
+                self._on_fiducials_changed()
+                self.fiducial_panel.set_program(self.program)
+        if len(refs) < 2:
             QMessageBox.warning(self, "Not enough fiducials",
                                  "This program has fewer than 2 fiducials, so a reference "
                                  "image cannot be aligned to board coordinates.")
             return
+        fiducials_mm = [(r.x_mm, r.y_mm) for r in refs]
+        labels = [r.id for r in refs]
 
         path, _ = QFileDialog.getOpenFileName(self, "Reference board image", "",
                                                "Images (*.png *.jpg *.jpeg *.bmp *.tif)")
         if not path:
             return
-        image = cv2.imread(path)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            image = cv2.imread(path)
+        finally:
+            QApplication.restoreOverrideCursor()
         if image is None:
             QMessageBox.critical(self, "Could not read image", f"Failed to open {Path(path).name}.")
             return
 
         from core.calibration import auto_calibrate
-        result = auto_calibrate(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), fiducials_mm)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = auto_calibrate(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), fiducials_mm)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Always confirm the reference alignment, even when automatic
+        # alignment claims success. Everything downstream is built on it
+        # -- ROI sizes are measured against it and fiducial templates are
+        # cut from it -- and a wrong alignment produces no error, just
+        # quietly wrong results forever after.
+        from ui.calibration_widget import CalibrationDialog
+        dialog = CalibrationDialog(image, fiducials_mm, parent=self, labels=labels,
+                                    initial_result=result if result.success else None)
         if not result.success:
-            # Same manual click fallback the live tab uses.
-            from ui.calibration_widget import CalibrationDialog
-            dialog = CalibrationDialog(image, fiducials_mm, parent=self)
-            dialog.widget.status_label.setText("Auto-align: " + result.message)
-            if dialog.exec_() != dialog.Accepted or not dialog.result_calibration:
-                return
-            result = dialog.result_calibration
+            dialog.widget.status_label.setText(
+                f"Auto-align could not place the fiducials ({result.message}) — "
+                f"click {', '.join(labels)} on the board instead."
+            )
+        if dialog.exec_() != dialog.Accepted or not dialog.result_calibration:
+            return
+        result = dialog.result_calibration
 
         self._apply_reference(
             image, result.homography,
@@ -812,6 +858,7 @@ class ProgramTab(QWidget):
     def _draw_detail(self, part):
         self.detail_scene.clear()
         self._backdrop_item = None  # cleared with the scene; don't reuse the dead item
+        self._size_text_item = None
         size = self.part_sizes.get(part, {"width_mm": DEFAULT_SIZE_MM, "height_mm": DEFAULT_SIZE_MM})
         w_px = size["width_mm"] * PX_PER_MM
         h_px = size["height_mm"] * PX_PER_MM
@@ -823,9 +870,11 @@ class ProgramTab(QWidget):
 
         rect = QRectF(-w_px / 2, -h_px / 2, w_px, h_px)
         self.current_rect_item = make_resizable_rect_item(
-            rect, on_resize=self._on_canvas_resize, filled=self._backdrop_item is None
+            rect, on_resize=self._on_canvas_resize, filled=self._backdrop_item is None,
+            on_resizing=self._on_canvas_resizing,
         )
         self.detail_scene.addItem(self.current_rect_item)
+        self._update_size_readout(size["width_mm"], size["height_mm"])
 
         cross_pen = QPen(QColor(80, 80, 80))
         self.detail_scene.addLine(-15, 0, 15, 0, cross_pen)
@@ -867,6 +916,42 @@ class ProgramTab(QWidget):
         self.detail_view.setSceneRect(-half, -half, 2 * half, 2 * half)
         self.detail_view.fitInView(-half, -half, 2 * half, 2 * half, Qt.KeepAspectRatio)
 
+    def _update_size_readout(self, w_mm, h_mm):
+        """Show the box dimensions, on the panel and on the canvas itself,
+        the way an AOI tuner does."""
+        self.size_readout.setText(f"{w_mm:.2f}  ×  {h_mm:.2f} mm")
+
+        item = getattr(self, "_size_text_item", None)
+        if item is not None and item.scene() is self.detail_scene:
+            self.detail_scene.removeItem(item)
+        self._size_text_item = None
+        if self.current_rect_item is None:
+            return
+
+        text = self.detail_scene.addSimpleText(f"{w_mm:.2f} × {h_mm:.2f} mm")
+        text.setBrush(QBrush(QColor(COLORS["accent"])))
+        font = text.font()
+        font.setBold(True)
+        font.setPointSizeF(max(9.0, getattr(self, "_detail_half_extent", 160.0) / 16.0))
+        text.setFont(font)
+        rect = self.current_rect_item.rect()
+        bounds = text.boundingRect()
+        text.setPos(rect.center().x() - bounds.width() / 2,
+                    rect.top() - bounds.height() - 4)
+        text.setZValue(10)
+        self._size_text_item = text
+
+    def _on_canvas_resizing(self, width_px, height_px):
+        """Live feedback during a drag: update the readout and the mm
+        boxes without committing, so the numbers track the handle."""
+        w_mm = width_px / PX_PER_MM
+        h_mm = height_px / PX_PER_MM
+        self._update_size_readout(w_mm, h_mm)
+        for spin, value in ((self.width_spin, w_mm), (self.height_spin, h_mm)):
+            spin.blockSignals(True)
+            spin.setValue(round(value, 2))
+            spin.blockSignals(False)
+
     def _on_canvas_resize(self, width_px, height_px):
         if not self.current_part:
             return
@@ -883,6 +968,7 @@ class ProgramTab(QWidget):
 
         self._refit_detail_window(width_px, height_px)
         self._draw_reference_backdrop()  # window grew -> re-cut the patch to match
+        self._update_size_readout(w_mm, h_mm)
         self._refresh_current_list_item()
 
     def on_spin_changed(self, _value):
@@ -898,6 +984,7 @@ class ProgramTab(QWidget):
         self.current_rect_item.setRect(-w_px / 2, -h_px / 2, w_px, h_px)
         self._refit_detail_window(w_px, h_px)
         self._draw_reference_backdrop()  # window grew -> re-cut the patch to match
+        self._update_size_readout(w_mm, h_mm)
 
         self._refresh_current_list_item()
 
