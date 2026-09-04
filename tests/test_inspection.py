@@ -7,12 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import cv2
-import numpy as np
-
 from core.inspection import (
     inspect, detect_panel_mode, expand_components, panel_unit_origins,
-    expanded_fiducials_mm, project_roi, PresenceThresholds,
+    expanded_fiducials_mm, project_roi,
 )
 from core.testutils import (
     make_synthetic_board_frame, place_homography, autosize_canvas, draw_components,
@@ -200,6 +197,35 @@ def test_rotation_changes_roi_footprint():
           "->", [round(v, 1) for v in turned])
 
 
+def test_repeated_designators_are_told_apart():
+    """A panel listed absolutely with no Pattern Offset rows is one unit
+    carrying five of every designator. Reporting five identical
+    "U1:R_DQ17" rows says a part is missing without saying which."""
+    from core.inspection import ComponentResult, UnitResult, _mark_ambiguous_designators
+
+    unit = UnitResult(label="U1", components=[
+        ComponentResult(designator="R17", part="PN-1", unit="U1", x_mm=10.0, y_mm=20.0),
+        ComponentResult(designator="R17", part="PN-1", unit="U1", x_mm=43.4, y_mm=20.0),
+        ComponentResult(designator="C1", part="PN-2", unit="U1", x_mm=5.0, y_mm=5.0),
+    ])
+    _mark_ambiguous_designators([unit])
+
+    labels = [c.label for c in unit.components]
+    assert labels[0] != labels[1], labels
+    assert "10.0,20.0" in labels[0] and "43.4,20.0" in labels[1], labels
+    assert labels[2] == "U1:C1", "a unique designator keeps its plain name"
+    print("OK test_repeated_designators_are_told_apart:", labels)
+
+
+def test_label_defaults_to_the_plain_name():
+    """Nothing that builds a result by hand has to know about the flag."""
+    from core.inspection import ComponentResult
+
+    comp = ComponentResult(designator="R1", part="PN-1", unit="U2", x_mm=1.0, y_mm=2.0)
+    assert comp.label == "U2:R1", comp.label
+    print("OK test_label_defaults_to_the_plain_name:", comp.label)
+
+
 if __name__ == "__main__":
     test_all_present_passes()
     test_missing_components_detected()
@@ -211,4 +237,6 @@ if __name__ == "__main__":
     test_panel_inspection_reports_per_unit()
     test_expanded_fiducials_follow_panel_mode()
     test_rotation_changes_roi_footprint()
+    test_repeated_designators_are_told_apart()
+    test_label_defaults_to_the_plain_name()
     print("\nALL INSPECTION TESTS PASSED")

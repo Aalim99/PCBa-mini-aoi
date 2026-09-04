@@ -68,6 +68,21 @@ class ComponentResult:
     # can show how close a call was and re-decide without re-capturing.
     std_min: float = 0.0
     range_min: float = 0.0
+    # Set when this designator is not unique within its unit; see
+    # _mark_ambiguous_designators.
+    ambiguous: bool = False
+
+    @property
+    def label(self) -> str:
+        """How this component is named in findings, overlays and the log.
+
+        A panel listed absolutely repeats every designator once per unit,
+        so five identical "U1:R_DQ17" rows would tell the operator a part
+        is missing without telling them which one to look at. Where the
+        name does not identify the part, the board position does.
+        """
+        base = f"{self.unit}:{self.designator}"
+        return f"{base} @{self.x_mm:.1f},{self.y_mm:.1f}mm" if self.ambiguous else base
 
     @property
     def missing(self) -> bool:
@@ -299,6 +314,22 @@ def to_gray(frame: np.ndarray, gray_settings=None) -> np.ndarray:
     return _to_gray(frame, gray_settings)
 
 
+def _mark_ambiguous_designators(units: List[UnitResult]) -> None:
+    """Flag components whose designator repeats within their own unit.
+
+    This is the normal state for a panel whose XY file lists every unit
+    absolutely but carries no Pattern Offset rows to split them by: the
+    whole panel is one unit, and each designator appears once per board
+    on it.
+    """
+    for unit in units:
+        counts: Dict[str, int] = {}
+        for comp in unit.components:
+            counts[comp.designator] = counts.get(comp.designator, 0) + 1
+        for comp in unit.components:
+            comp.ambiguous = counts[comp.designator] > 1
+
+
 def _verdict_for(units: List[UnitResult]) -> Tuple[str, str]:
     missing = [c for u in units for c in u.missing]
     unchecked = [c for u in units for c in u.unchecked]
@@ -406,6 +437,7 @@ def inspect(
         unit.components.append(result)
 
     ordered = [units[k] for k in sorted(units.keys())]
+    _mark_ambiguous_designators(ordered)
     verdict, message = _verdict_for(ordered)
 
     return InspectionResult(

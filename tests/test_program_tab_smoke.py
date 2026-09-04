@@ -10,9 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PyQt5.QtWidgets import QApplication, QMainWindow
 from PyQt5.QtCore import Qt, QPoint, QPointF, QEvent
 from PyQt5.QtGui import QMouseEvent
-from PyQt5.QtTest import QTest
 
-from ui.program_tab import ProgramTab, PX_PER_MM
+from ui.program_tab import ProgramTab
 
 
 def send_mouse_event(widget, etype, pos, button, buttons):

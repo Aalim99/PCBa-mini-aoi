@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openpyxl import Workbook
 
-from core.program_parser import load_mounter_xy, parse_program
+from core.program_parser import parse_program
 
 tmp = Path(tempfile.mkdtemp())
 
@@ -138,6 +138,122 @@ R2,20,10,PN-1,MOUNT
     print("OK test_unrecognised_type_values_do_not_empty_the_program")
 
 
+def test_export_banner_rows_are_not_components():
+    """A real mounter export interleaves its own section banners with
+    the placements: a bracketed title wrapped across rows, then a rule.
+    Imported as components they are permanently unsized, so every board
+    comes back INCOMPLETE."""
+    path = write("banner.csv", """Position Data
+X,Y,Rotation,Z,Designator,Library,Part,Skip No,Type,Pattern Type,Pattern Group
+133.64,140.34,270,0,[PLACEMENT,,,0,Placement,P1,Ist Group
+133.64,140.34,270,0,ITEM,,,0,Placement,P1,Ist Group
+133.64,140.34,270,0,------------------------,,,0,Placement,P1,Ist Group
+147.805,16.96,180,0,U9,UHAN,102-001541,0,Placement,P1,Ist Group
+147.805,28.37,180,0,U8,UHAN,102-001541,0,Placement,P1,Ist Group
+30.05,139.14,0,0,,,,,Pattern Fiducial,P1,Ist Group
+""")
+    program = parse_program(str(path), "BANNER")
+    assert {c["designator"] for c in program["components"]} == {"U9", "U8"}, \
+        program["components"]
+    assert any("marker row" in n for n in program["notes"]), program["notes"]
+    print("OK test_export_banner_rows_are_not_components:",
+          len(program["components"]), "components,", len(program["notes"]), "note(s)")
+
+
+def test_fiducial_marks_listed_as_placements_are_dropped():
+    """The board's own F1/F2/F3 marks are listed among the placements
+    with no part number. They are alignment marks, not parts to inspect,
+    and could never be sized."""
+    path = write("fidmarks.csv", """X,Y,Rotation,Designator,Library,Part,Type
+146.44,8.69,270,F3,,,Placement
+153.64,138.64,270,F2,,,Placement
+163.69,139.14,270,F1,,,Placement
+147.805,16.96,180,U9,UHAN,102-001541,Placement
+147.805,28.37,180,U8,UHAN,102-001541,Placement
+147.805,39.78,180,U7,UHAN,102-001541,Placement
+""")
+    program = parse_program(str(path), "FIDMARKS")
+    assert {c["designator"] for c in program["components"]} == {"U9", "U8", "U7"}
+    note = [n for n in program["notes"] if "no part number" in n]
+    assert note and "F1" in note[0], program["notes"]
+    print("OK test_fiducial_marks_listed_as_placements_are_dropped:", note[0])
+
+
+def test_a_file_that_records_no_parts_at_all_still_imports():
+    """The guard on the rule above: an export with no part numbers
+    anywhere must import in full, not come back empty."""
+    path = write("noparts.csv", """X,Y,Rotation,Designator,Type
+10,10,0,R1,Placement
+20,10,0,R2,Placement
+30,10,0,R3,Placement
+""")
+    program = parse_program(str(path), "NOPARTS")
+    assert len(program["components"]) == 3, program["components"]
+    assert all(c["part"] is None for c in program["components"])
+    print("OK test_a_file_that_records_no_parts_at_all_still_imports: 3 components kept")
+
+
+def test_mostly_unidentified_file_is_left_alone():
+    """Only a minority of leftovers is treated as leftovers. A file where
+    most rows carry no part is a file that does not record parts."""
+    path = write("mostly.csv", """X,Y,Designator,Part,Type
+10,10,R1,,Placement
+20,10,R2,,Placement
+30,10,R3,,Placement
+40,10,R4,PN-1,Placement
+""")
+    program = parse_program(str(path), "MOSTLY")
+    assert len(program["components"]) == 4, program["components"]
+    print("OK test_mostly_unidentified_file_is_left_alone: 4 components kept")
+
+
+def test_skipped_placements_are_not_inspected():
+    """A part the mounter is told not to place is missing by design;
+    inspecting it fails every board."""
+    path = write("skip.csv", """X,Y,Designator,Part,Skip,Type
+10,10,R1,PN-1,0,Placement
+20,10,R2,PN-1,1,Placement
+30,10,R3,PN-1,No,Placement
+40,10,R4,PN-1,Yes,Placement
+""")
+    program = parse_program(str(path), "SKIP")
+    assert {c["designator"] for c in program["components"]} == {"R1", "R3"}, \
+        program["components"]
+    assert any("not to place" in n for n in program["notes"]), program["notes"]
+    print("OK test_skipped_placements_are_not_inspected:",
+          [c["designator"] for c in program["components"]])
+
+
+def test_numeric_skip_zero_is_not_a_skip():
+    """A spreadsheet hands back 0.0 where the file says 0. Read as text
+    that is "0.0", which is not "no" -- and every part would be dropped
+    or the column disowned."""
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Position Data"])
+    ws.append(["X", "Y", "Rotation", "Designator", "Part", "Skip No", "Type"])
+    ws.append([10.0, 10.0, 0, "R1", "PN-1", 0, "Placement"])
+    ws.append([20.0, 10.0, 0, "R2", "PN-1", 0, "Placement"])
+    path = tmp / "numeric_skip.xlsx"
+    wb.save(path)
+
+    program = parse_program(str(path), "NUMSKIP")
+    assert len(program["components"]) == 2, program["components"]
+    assert not any("Skip" in n for n in program["notes"]), program["notes"]
+    print("OK test_numeric_skip_zero_is_not_a_skip: 2 components, no Skip complaint")
+
+
+def test_unrecognised_skip_values_are_disowned_not_guessed():
+    path = write("skipnum.csv", """X,Y,Designator,Part,Skip,Type
+10,10,R1,PN-1,3,Placement
+20,10,R2,PN-1,7,Placement
+""")
+    program = parse_program(str(path), "SKIPNUM")
+    assert len(program["components"]) == 2, "an unreadable Skip column must not drop parts"
+    assert any("does not recognise" in n for n in program["notes"]), program["notes"]
+    print("OK test_unrecognised_skip_values_are_disowned_not_guessed")
+
+
 def test_ragged_rows_and_blank_lines():
     path = write("ragged.csv", """Some Title
 X,Y,Rotation,Designator,Part,Type
@@ -224,6 +340,13 @@ if __name__ == "__main__":
     test_no_type_column_still_imports()
     test_no_part_column_is_reported()
     test_unrecognised_type_values_do_not_empty_the_program()
+    test_export_banner_rows_are_not_components()
+    test_fiducial_marks_listed_as_placements_are_dropped()
+    test_a_file_that_records_no_parts_at_all_still_imports()
+    test_mostly_unidentified_file_is_left_alone()
+    test_skipped_placements_are_not_inspected()
+    test_numeric_skip_zero_is_not_a_skip()
+    test_unrecognised_skip_values_are_disowned_not_guessed()
     test_ragged_rows_and_blank_lines()
     test_bom_and_crlf()
     test_excel_still_works()

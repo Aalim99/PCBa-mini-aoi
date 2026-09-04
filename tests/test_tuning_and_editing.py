@@ -11,11 +11,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import numpy as np
 
 from core.inspection import (
     ComponentResult, InspectionResult, PresenceThresholds, UnitResult,
-    decide_presence, inspect, measure_roi, reevaluate,
+    decide_presence, inspect, reevaluate,
 )
 from core.thresholds import (
     clamp_sensitivity, effective_thresholds, load_part_thresholds,

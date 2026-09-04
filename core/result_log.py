@@ -35,7 +35,9 @@ PAIR_SEP = ":"
 
 
 def _fmt_missing(result) -> str:
-    return LIST_SEP.join(f"{c.unit}{PAIR_SEP}{c.designator}" for c in result.missing)
+    # c.label carries the unit and, where a designator repeats within it,
+    # the board position that tells two placements apart.
+    return LIST_SEP.join(c.label for c in result.missing)
 
 
 def _fmt_unit_verdicts(result) -> str:

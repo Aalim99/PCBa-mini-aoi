@@ -23,7 +23,7 @@ from core.fiducials import (
     set_fiducial_refs, suggest_fiducial_refs, teach_templates,
 )
 from core.testutils import (
-    make_synthetic_board_frame, place_homography, autosize_canvas, draw_components,
+    make_synthetic_board_frame, place_homography, autosize_canvas,
 )
 
 

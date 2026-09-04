@@ -18,8 +18,10 @@ Handles:
         Pattern Fiducial   -> alignment reference points
         Pattern Offset     -> panel repeat positions (if the file is a
                                panel of multiple identical board units)
-  - filtering out junk/marker rows (e.g. a placeholder row with a
-    dashed Designator and no Part/Library)
+  - dropping what cannot be inspected: the export's own section
+    banners and rules, placements carrying neither a part number nor a
+    library (they could never be given an ROI size), and rows the
+    mounter is told to skip. Every drop is counted in `notes`.
 
 Only X, Y and Designator are genuinely required: without them there is
 nothing to inspect. Type, Rotation, Part and Library are optional and
@@ -46,7 +48,13 @@ TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
 # The minimum needed to inspect anything.
 REQUIRED_COLUMNS = {"X", "Y", "Designator"}
 # Understood but optional, with defaults applied when absent.
-OPTIONAL_COLUMNS = {"Type", "Rotation", "Part", "Library"}
+OPTIONAL_COLUMNS = {"Type", "Rotation", "Part", "Library", "Skip"}
+
+# Values a Skip column may hold. Anything outside this vocabulary means
+# the column is not the yes/no flag we take it for (a "Skip Number", say),
+# and it is then ignored rather than guessed at.
+SKIP_TRUE = {"1", "y", "yes", "true", "skip", "x", "dnp"}
+SKIP_FALSE = {"0", "n", "no", "false", "place", "", "nan", "none"}
 
 # Column aliases across mounter/CAD dialects. Keys are canonicalised
 # (lower case, non-alphanumerics stripped), so "Center-X (mm)" and
@@ -66,6 +74,8 @@ COLUMN_ALIASES = {
     "part": "Part", "partnumber": "Part", "partno": "Part", "partnum": "Part",
     "itemnumber": "Part", "materialnumber": "Part", "feedername": "Part",
     "type": "Type", "recordtype": "Type", "rowtype": "Type",
+    "skip": "Skip", "skipno": "Skip", "skipped": "Skip", "noplace": "Skip",
+    "donotplace": "Skip", "dnp": "Skip",
 }
 
 PLACEMENT = "Placement"
@@ -150,15 +160,81 @@ def _frame_from_rows(rows, header_index: int) -> pd.DataFrame:
 
 
 def _is_junk_row(row: pd.Series) -> bool:
-    """Flags placeholder/marker rows that aren't real components.
-    e.g. Designator made only of dashes/punctuation, or empty Part
-    and Library on a 'Placement' row."""
+    """Flags marker rows that aren't components, by designator alone.
+
+    Mounter exports interleave section markers with the placements --
+    a rule of dashes, or a bracketed banner such as "[PLACEMENT ITEM
+    ...]" that the export wrapped across several rows. A real reference
+    designator never opens with a bracket or is made only of rules.
+    """
     designator = str(row.get("Designator", "")).strip()
     if designator == "" or designator.lower() == "nan":
         return True
-    if all(ch in "-_= " for ch in designator):
+    if all(ch in "-_=*. " for ch in designator):
+        return True
+    if designator[0] in "[<{#":
         return True
     return False
+
+
+def _is_unidentifiable(row: pd.Series) -> bool:
+    """A placement carrying neither a part number nor a library.
+
+    ROI sizes are keyed on the part number, so such a row can never be
+    sized and therefore never inspected: it would sit in "unchecked" for
+    the life of the program and hold every verdict at INCOMPLETE. In
+    practice these are the export's own leftovers -- the second line of a
+    wrapped banner, or the board's F1/F2/F3 marks listed among the
+    placements. Only applied when the file does record part numbers;
+    see _records_parts.
+    """
+    for field in ("Part", "Library"):
+        value = row.get(field)
+        if not pd.isna(value) and str(value).strip():
+            return False
+    return True
+
+
+def _records_parts(placements: pd.DataFrame, threshold: float = 0.5) -> bool:
+    """Whether this file identifies its placements at all.
+
+    Plenty of exports are a bare X/Y/Designator list with no part
+    number anywhere; dropping unidentifiable rows there would empty the
+    program. So the rule only applies to a file where most placements do
+    carry an identity and the few that don't stand out as leftovers.
+    """
+    columns = [c for c in ("Part", "Library") if c in placements.columns]
+    if not columns or placements.empty:
+        return False
+    identified = ~placements.apply(_is_unidentifiable, axis=1)
+    return bool(identified.mean() >= threshold)
+
+
+def _skip_token(value) -> str:
+    """Canonical form of a Skip cell. Numbers are normalised first: a
+    spreadsheet hands back 0.0 where the file says 0, and "00" is not a
+    value any yes/no vocabulary contains."""
+    if isinstance(value, (int, float, np.integer, np.floating)) and not pd.isna(value):
+        if float(value) == int(value):
+            return str(int(value))
+    return _canonical(value)
+
+
+def _skip_flags(placements: pd.DataFrame):
+    """(mask of rows the mounter is told not to place, note or None).
+
+    A part that was never placed is missing by design; inspecting it
+    fails every board and teaches the operator to ignore the verdict.
+    """
+    if "Skip" not in placements.columns or placements.empty:
+        return None, None
+    values = placements["Skip"].map(_skip_token)
+    unknown = sorted({v for v in values.unique() if v not in SKIP_TRUE | SKIP_FALSE})
+    if unknown:
+        return None, ("A Skip column was found but holds values this app does not "
+                      f"recognise as yes/no ({', '.join(unknown[:4])}); it was ignored, "
+                      "so any not-placed parts will be reported missing.")
+    return values.isin(SKIP_TRUE), None
 
 
 def _to_float(value, field, designator) -> float:
@@ -235,10 +311,36 @@ def parse_program(filepath: str, program_name: str, is_panel: bool = None) -> di
                      "them on a reference image.")
         placements, fiducials, offsets = df.copy(), df.iloc[0:0], df.iloc[0:0]
 
-    # filter junk rows out of placements only (fiducials/offsets don't
-    # carry a meaningful Designator anyway)
+    # Filter placements only; fiducials/offsets don't carry a meaningful
+    # Designator anyway. Each drop is counted and reported in notes --
+    # a component that quietly vanishes from a program is worse than one
+    # that is wrongly present, because nothing downstream can show it.
     if not placements.empty:
+        before = len(placements)
         placements = placements[~placements.apply(_is_junk_row, axis=1)]
+        markers = before - len(placements)
+        if markers:
+            notes.append(f"Skipped {markers} marker row(s) from the export "
+                         "(section banners and rules, not components).")
+
+    if not placements.empty and _records_parts(placements):
+        before = len(placements)
+        dropped = placements[placements.apply(_is_unidentifiable, axis=1)]
+        placements = placements.drop(dropped.index)
+        if before - len(placements):
+            examples = ", ".join(sorted({str(d).strip() for d in dropped["Designator"]})[:5])
+            notes.append(f"Skipped {before - len(placements)} row(s) with no part number "
+                         f"or library ({examples}) - they cannot be sized, so they could "
+                         "never be inspected.")
+
+    if not placements.empty:
+        skip_mask, skip_note = _skip_flags(placements)
+        if skip_note:
+            notes.append(skip_note)
+        elif skip_mask is not None and skip_mask.any():
+            notes.append(f"Skipped {int(skip_mask.sum())} placement(s) the mounter is "
+                         "told not to place (Skip column).")
+            placements = placements[~skip_mask]
 
     if is_panel is None:
         is_panel = len(offsets) > 0

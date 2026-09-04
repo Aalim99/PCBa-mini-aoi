@@ -11,14 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
-import numpy as np
 from PyQt5.QtWidgets import QApplication
 
 import main as app_main
 from core.fiducials import FiducialRef, save_templates, set_fiducial_refs, teach_templates
-from core.inspection import PresenceThresholds
 from core.reference_image import save_reference
-from core.result_log import append_result
 from core.camera import StillImageSource
 from core.testutils import (
     make_synthetic_board_frame, place_homography, autosize_canvas, draw_components,

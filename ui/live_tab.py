@@ -607,7 +607,7 @@ class LiveTab(QWidget):
                     color = (0, 0, 255)
                 cv2.rectangle(out, (int(x), int(y)), (int(x + w), int(y + h)), color, 2)
                 if comp.missing:
-                    cv2.putText(out, f"{comp.unit}:{comp.designator}", (int(x), int(y) - 4),
+                    cv2.putText(out, comp.label, (int(x), int(y) - 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
         return out
 
@@ -629,7 +629,7 @@ class LiveTab(QWidget):
                 break
             shown += 1
             item = QListWidgetItem(
-                f"MISSING   {comp.unit}:{comp.designator}   {comp.part or '-'}"
+                f"MISSING   {comp.label}   {comp.part or '-'}"
                 f"      {comp.margin:.2f}x"
             )
             item.setData(Qt.UserRole, comp)
@@ -643,7 +643,7 @@ class LiveTab(QWidget):
             if shown >= MAX_FINDINGS_SHOWN:
                 break
             shown += 1
-            item = QListWidgetItem(f"UNCHECKED   {comp.unit}:{comp.designator}   ({comp.status})")
+            item = QListWidgetItem(f"UNCHECKED   {comp.label}   ({comp.status})")
             item.setData(Qt.UserRole, None)
             self.missing_list.addItem(item)
 

@@ -16,7 +16,11 @@ python main.py
 In **Program Manager**:
 
 1. **Import XY…** — parse the mounter's pick-and-place export into a
-   program: components, fiducials, and panel offsets.
+   program: components, fiducials, and panel offsets. Rows that cannot
+   be inspected are dropped and counted in the import notes: the
+   export's own section banners, placements with neither a part number
+   nor a library (nothing to size), and anything the mounter is told to
+   skip.
 2. **Load Reference…** — a photo of a known-good board, aligned to the
    program's fiducials. Everything below depends on it, so the alignment
    is always put in front of you to confirm: click F1, F2 and F3 on the
@@ -134,6 +138,11 @@ Worth knowing before trusting a verdict:
 - **Taught templates assume the station doesn't change.** They are
   matched across a range of scales, but re-teach after moving the
   camera, changing the lens, or changing the lighting.
+- **A panel with no Pattern Offset rows is one unit.** Some exports
+  list every unit's components absolutely without recording the panel
+  repeat, so the whole panel is inspected as a single unit and the
+  verdict covers all of it. Findings name the board position alongside
+  the designator there, since the same designator appears once per unit.
 - **Panel offset semantics are auto-detected.** A mounter file may list
   every unit's components absolutely, or list one unit for the Pattern
   Offsets to repeat. Which one is inferred from the data; set
